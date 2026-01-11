@@ -2,6 +2,8 @@
 
 Codex supports a wide range of AI models, from OpenAI's latest models to local open-source models running on your own machine. This guide explains how to select models and configure custom model providers.
 
+> **Note:** This documentation applies to Codex CLI. If you're using Codex in an IDE (VS Code, Cursor, Windsurf), the configuration is shared through `~/.codex/config.toml`, so the examples below will work for both CLI and IDE usage. For IDE-specific features, see the [IDE documentation](https://developers.openai.com/codex/ide/features).
+
 ## Quick Start
 
 ### Using OpenAI Models (Default)
@@ -285,11 +287,20 @@ Codex will automatically:
 
 ### Model Selection with LMStudio
 
-When using `--oss`, Codex defaults to `openai/gpt-oss-20b`. You can override this:
+When using `--oss` with LMStudio (the default local provider), Codex defaults to `openai/gpt-oss-20b`. You can override this:
 
 ```bash
 codex --oss -m deepseek/r1-distill-qwen-32b
 codex --oss -m meta-llama/llama-3.3-70b-instruct
+```
+
+### Model Selection with Ollama
+
+When using Ollama, the default model is `gpt-oss:20b`. You can override this:
+
+```bash
+codex --oss --local-provider ollama -m llama3.3:70b
+codex --oss --local-provider ollama -m deepseek-r1:32b
 ```
 
 ### Ollama Setup
@@ -297,6 +308,8 @@ codex --oss -m meta-llama/llama-3.3-70b-instruct
 1. Install Ollama from [ollama.ai](https://ollama.ai/)
 2. Pull models: `ollama pull llama3.3:70b`
 3. Run Codex: `codex --oss --local-provider ollama -m llama3.3:70b`
+
+The default model for Ollama is `gpt-oss:20b`.
 
 ## Environment Variables
 
