@@ -6,6 +6,10 @@ For advanced configuration instructions, see [this documentation](https://develo
 
 For a full configuration reference, see [this documentation](https://developers.openai.com/codex/config-reference).
 
+## Model Selection
+
+To learn how to select models and configure custom model providers (including local models like LMStudio and Ollama), see [Model Selection & Custom Providers](./models.md).
+
 ## Lifecycle hooks
 
 Admins can set top-level `allow_managed_hooks_only = true` in
