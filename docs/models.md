@@ -108,12 +108,14 @@ Each model provider can be configured with these options:
 
 #### Wire Protocol
 
-- **`wire_api`** - API protocol to use (default: `"chat"`)
+- **`wire_api`** - API protocol to use (default: `"responses"`)
   - `"responses"` - Modern OpenAI Responses API (used by OpenAI, LMStudio)
-  - `"chat"` - Classic Chat Completions API (used by most providers)
-  
+
+  The legacy `"chat"` (Chat Completions) wire API has been removed; providers
+  must expose the Responses API.
+
   ```toml
-  wire_api = "chat"  # or "responses"
+  wire_api = "responses"
   ```
 
 #### HTTP Configuration
