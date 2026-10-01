@@ -2,11 +2,13 @@ use crate::config::OtelExporter;
 use crate::metrics::Result;
 use crate::metrics::names::API_CALL_COUNT_METRIC;
 use crate::metrics::names::API_CALL_DURATION_METRIC;
+use crate::metrics::names::EXEC_SERVER_CLIENT_REQUEST_COUNT_METRIC;
 use crate::metrics::names::RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC;
 use crate::metrics::names::RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC;
 use crate::metrics::names::RESPONSES_API_ENGINE_SERVICE_TTFT_DURATION_METRIC;
 use crate::metrics::names::TOOL_CALL_COUNT_METRIC;
 use crate::metrics::names::TOOL_CALL_DURATION_METRIC;
+use crate::metrics::names::TURN_COST_MICROUSD_METRIC;
 use crate::metrics::names::TURN_TOKEN_USAGE_METRIC;
 use crate::metrics::validation::validate_tag_key;
 use crate::metrics::validation::validate_tag_value;
@@ -22,11 +24,14 @@ const STATSIG_DISABLED_METRICS: &[&str] = &[
     API_CALL_COUNT_METRIC,
     API_CALL_DURATION_METRIC,
     CONVERSATION_TURN_COUNT_METRIC,
+    // Caller-side executor volume belongs in configured observability collectors.
+    EXEC_SERVER_CLIENT_REQUEST_COUNT_METRIC,
     RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC,
     RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC,
     RESPONSES_API_ENGINE_SERVICE_TTFT_DURATION_METRIC,
     TOOL_CALL_COUNT_METRIC,
     TOOL_CALL_DURATION_METRIC,
+    TURN_COST_MICROUSD_METRIC,
     TURN_TOKEN_USAGE_METRIC,
 ];
 
@@ -38,6 +43,7 @@ pub enum MetricsExporter {
 
 #[derive(Clone, Debug)]
 pub struct MetricsConfig {
+    pub(crate) http_client_factory: codex_http_client::HttpClientFactory,
     pub(crate) environment: String,
     pub(crate) service_name: String,
     pub(crate) service_version: String,
@@ -49,6 +55,14 @@ pub struct MetricsConfig {
 }
 
 impl MetricsConfig {
+    pub fn with_http_client_factory(
+        mut self,
+        factory: codex_http_client::HttpClientFactory,
+    ) -> Self {
+        self.http_client_factory = factory;
+        self
+    }
+
     pub fn otlp(
         environment: impl Into<String>,
         service_name: impl Into<String>,
@@ -61,6 +75,9 @@ impl MetricsConfig {
             &[]
         };
         Self {
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
             environment: environment.into(),
             service_name: service_name.into(),
             service_version: service_version.into(),
@@ -80,6 +97,9 @@ impl MetricsConfig {
         exporter: InMemoryMetricExporter,
     ) -> Self {
         Self {
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
             environment: environment.into(),
             service_name: service_name.into(),
             service_version: service_version.into(),

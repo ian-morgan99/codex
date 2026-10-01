@@ -11,6 +11,8 @@ use codex_utils_pty::JobObject;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::BorrowedHandle;
+use std::os::windows::io::OwnedHandle;
 use std::path::Path;
 use std::ptr;
 use std::sync::Arc;
@@ -70,7 +72,7 @@ pub fn make_env_block(env: &HashMap<String, String>) -> Vec<u16> {
 unsafe fn ensure_inheritable_stdio(si: &mut STARTUPINFOW) -> Result<()> {
     for kind in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
         let h = GetStdHandle(kind);
-        if h == 0 || h == INVALID_HANDLE_VALUE {
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
             return Err(anyhow!("GetStdHandle failed: {}", GetLastError()));
         }
         if SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
@@ -97,12 +99,11 @@ pub unsafe fn create_process_as_user(
     logs_base_dir: Option<&Path>,
     stdio: Option<(HANDLE, HANDLE, HANDLE)>,
     console_mode: ConsoleMode,
-    use_private_desktop: bool,
+    desktop: LaunchDesktop,
 ) -> Result<CreatedProcess> {
     let cmdline_str = argv_to_command_line(argv);
     let mut cmdline: Vec<u16> = to_wide(&cmdline_str);
     let env_block = make_env_block(env_map);
-    let desktop = LaunchDesktop::prepare(use_private_desktop, logs_base_dir)?;
     let job = Arc::new(JobObject::create().context("create process job")?);
     let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
     let cwd_wide = to_wide(cwd);
@@ -113,9 +114,13 @@ pub unsafe fn create_process_as_user(
         | (None, ConsoleMode::Inherit)
         | (None, ConsoleMode::NoWindow) => 0,
     };
-    let attr_count = if stdio.is_some() { 2 } else { 1 };
+    let preserve_app_context = crate::app_package::current_process_has_package_identity()?;
+    let attr_count = if stdio.is_some() { 2 } else { 1 } + u32::from(preserve_app_context);
     let mut attrs = ProcThreadAttributeList::new(attr_count)?;
     attrs.set_job(job.as_raw_handle() as HANDLE)?;
+    if preserve_app_context {
+        attrs.preserve_desktop_app_context()?;
+    }
 
     let mut si: STARTUPINFOEXW = std::mem::zeroed();
     si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -222,22 +227,22 @@ impl PipeSpawnHandles {
 /// Spawns a process with anonymous pipes and returns the relevant handles.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_process_with_pipes(
-    h_token: HANDLE,
+    h_token: BorrowedHandle<'_>,
     argv: &[String],
     cwd: &Path,
     env_map: &HashMap<String, String>,
     stdin_mode: StdinMode,
     stderr_mode: StderrMode,
     console_mode: ConsoleMode,
-    use_private_desktop: bool,
+    desktop: LaunchDesktop,
     logs_base_dir: Option<&Path>,
 ) -> Result<PipeSpawnHandles> {
-    let mut in_r: HANDLE = 0;
-    let mut in_w: HANDLE = 0;
-    let mut out_r: HANDLE = 0;
-    let mut out_w: HANDLE = 0;
-    let mut err_r: HANDLE = 0;
-    let mut err_w: HANDLE = 0;
+    let mut in_r: HANDLE = std::ptr::null_mut();
+    let mut in_w: HANDLE = std::ptr::null_mut();
+    let mut out_r: HANDLE = std::ptr::null_mut();
+    let mut out_w: HANDLE = std::ptr::null_mut();
+    let mut err_r: HANDLE = std::ptr::null_mut();
+    let mut err_w: HANDLE = std::ptr::null_mut();
     unsafe {
         if CreatePipe(&mut in_r, &mut in_w, ptr::null_mut(), 0) == 0 {
             return Err(anyhow!("CreatePipe stdin failed: {}", GetLastError()));
@@ -266,14 +271,14 @@ pub fn spawn_process_with_pipes(
     let stdio = Some((in_r, out_w, stderr_handle));
     let spawn_result = unsafe {
         create_process_as_user(
-            h_token,
+            h_token.as_raw_handle(),
             argv,
             cwd,
             env_map,
             logs_base_dir,
             stdio,
             console_mode,
-            use_private_desktop,
+            desktop,
         )
     };
     let created = match spawn_result {
@@ -326,8 +331,8 @@ pub fn spawn_process_with_pipes(
     })
 }
 
-/// Reads a HANDLE until EOF and invokes `on_chunk` for each read.
-pub fn read_handle_loop<F>(handle: HANDLE, mut on_chunk: F) -> std::thread::JoinHandle<()>
+/// Reads an owned handle until EOF and invokes `on_chunk` for each read.
+pub fn read_handle_loop<F>(handle: OwnedHandle, mut on_chunk: F) -> std::thread::JoinHandle<()>
 where
     F: FnMut(&[u8]) + Send + 'static,
 {
@@ -337,7 +342,7 @@ where
             let mut read_bytes: u32 = 0;
             let ok = unsafe {
                 ReadFile(
-                    handle,
+                    handle.as_raw_handle(),
                     buf.as_mut_ptr(),
                     buf.len() as u32,
                     &mut read_bytes,
@@ -348,9 +353,6 @@ where
                 break;
             }
             on_chunk(&buf[..read_bytes as usize]);
-        }
-        unsafe {
-            CloseHandle(handle);
         }
     })
 }

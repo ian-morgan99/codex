@@ -103,6 +103,7 @@ async fn adds_weighted_initial_and_threshold_reminders(
     test.submit_turn("second turn").await?;
 
     let requests = responses.requests();
+    assert!(requests[0].has_content_kinds(&["rollout_budget.remaining_tokens"]));
     assert_eq!(
         rollout_budget_texts(&requests[0]),
         vec![rollout_budget_message(/*remaining_tokens*/ 100)]
@@ -375,12 +376,7 @@ async fn compaction_budget_exhaustion_fails_without_retry(
                 reminder_at_remaining_tokens: vec![5],
                 ..rollout_budget()
             });
-            if remote_v2 {
-                config
-                    .features
-                    .enable(Feature::RemoteCompactionV2)
-                    .expect("test config should allow remote compaction v2");
-            } else {
+            if !remote_v2 {
                 config.model_provider.name = "OpenAI-compatible test provider".to_string();
             }
         })
@@ -465,52 +461,6 @@ async fn restates_the_current_remainder_after_compaction() -> Result<()> {
     assert!(
         summary_position < reminder_position,
         "the current remainder should follow the compaction summary"
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn restates_the_current_remainder_after_rollback() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let responses = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                ev_completed_with_tokens("resp-1", /*total_tokens*/ 30),
-            ]),
-            sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
-        ],
-    )
-    .await;
-    let test = test_codex()
-        .with_config(|config| {
-            config.rollout_budget = Some(RolloutBudgetConfig {
-                reminder_at_remaining_tokens: vec![50],
-                ..rollout_budget()
-            });
-        })
-        .build(&server)
-        .await?;
-
-    test.submit_turn("rolled-back turn").await?;
-    test.codex
-        .submit(Op::ThreadRollback { num_turns: 1 })
-        .await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::ThreadRolledBack(_))
-    })
-    .await;
-    test.submit_turn("turn after rollback").await?;
-
-    let requests = responses.requests();
-    assert_eq!(
-        rollout_budget_texts(&requests[1]),
-        vec![rollout_budget_message(/*remaining_tokens*/ 70)],
-        "rollback should rearm the current budget reminder without refunding usage"
     );
 
     Ok(())

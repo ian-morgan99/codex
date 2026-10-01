@@ -50,6 +50,8 @@ pub(crate) enum TerminalTitleItem {
     /// Compact runtime run-state text.
     #[strum(to_string = "run-state", serialize = "status")]
     Status,
+    /// Current thread name, omitted when unnamed.
+    ThreadName,
     /// Current thread title (if available).
     #[strum(to_string = "thread-title", serialize = "thread")]
     Thread,
@@ -81,6 +83,8 @@ pub(crate) enum TerminalTitleItem {
     SessionId,
     /// Whether Fast mode is currently active.
     FastMode,
+    /// Whether Daybreak is enabled for this thread.
+    Daybreak,
     /// Current model name.
     #[strum(to_string = "model", serialize = "model-name")]
     Model,
@@ -99,11 +103,12 @@ impl TerminalTitleItem {
             TerminalTitleItem::Project => "Project name (falls back to current directory name)",
             TerminalTitleItem::CurrentDir => "Current working directory",
             TerminalTitleItem::Spinner => {
-                "Spinner while working, action-required message while blocked."
+                "Spinner while working, action-required message while blocked"
             }
             TerminalTitleItem::Status => {
                 "Compact session run-state text (Ready, Working, Thinking)"
             }
+            TerminalTitleItem::ThreadName => "Current thread name (omitted when unnamed)",
             TerminalTitleItem::Thread => "Current thread title, or thread identifier when unnamed",
             TerminalTitleItem::GitBranch => "Current Git branch (omitted when unavailable)",
             TerminalTitleItem::ContextRemaining => {
@@ -132,6 +137,7 @@ impl TerminalTitleItem {
                 "Current thread identifier (omitted until thread starts)"
             }
             TerminalTitleItem::FastMode => "Whether Fast mode is currently active",
+            TerminalTitleItem::Daybreak => "Whether Daybreak is enabled for this thread",
             TerminalTitleItem::Model => "Current model name",
             TerminalTitleItem::ModelWithReasoning => "Current model name with reasoning level",
             TerminalTitleItem::Reasoning => "Current reasoning level",
@@ -148,6 +154,7 @@ impl TerminalTitleItem {
             TerminalTitleItem::CurrentDir => Some(StatusSurfacePreviewItem::CurrentDir),
             TerminalTitleItem::Spinner => None,
             TerminalTitleItem::Status => Some(StatusSurfacePreviewItem::Status),
+            TerminalTitleItem::ThreadName => Some(StatusSurfacePreviewItem::ThreadName),
             TerminalTitleItem::Thread => Some(StatusSurfacePreviewItem::ThreadTitle),
             TerminalTitleItem::GitBranch => Some(StatusSurfacePreviewItem::GitBranch),
             TerminalTitleItem::ContextRemaining => Some(StatusSurfacePreviewItem::ContextRemaining),
@@ -166,6 +173,7 @@ impl TerminalTitleItem {
             }
             TerminalTitleItem::SessionId => Some(StatusSurfacePreviewItem::SessionId),
             TerminalTitleItem::FastMode => Some(StatusSurfacePreviewItem::FastMode),
+            TerminalTitleItem::Daybreak => Some(StatusSurfacePreviewItem::Daybreak),
             TerminalTitleItem::Model => Some(StatusSurfacePreviewItem::Model),
             TerminalTitleItem::ModelWithReasoning => {
                 Some(StatusSurfacePreviewItem::ModelWithReasoning)

@@ -2,10 +2,10 @@
 //!
 //! Feedback upload should never depend on doctor succeeding. This module runs
 //! the configured Codex executable as a subprocess, accepts only valid JSON from
-//! `codex doctor --json`, derives a small set of Sentry tags, and otherwise
+//! `codex doctor --json --feedback`, derives a small set of Sentry tags, and otherwise
 //! skips the attachment with a warning. Keeping the report generation out of the
 //! app-server process avoids sharing doctor internals across crates while still
-//! attaching exactly the same JSON a user could copy from the CLI.
+//! using the CLI's JSON report format with bounded database scans.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -20,7 +20,9 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::warn;
 
-const DOCTOR_FEEDBACK_REPORT_TIMEOUT: Duration = Duration::from_secs(25);
+// Keep the existing 25-second diagnostic allowance plus the filesystem
+// probe budget (eight seconds) and a small amount of process overhead.
+const DOCTOR_FEEDBACK_REPORT_TIMEOUT: Duration = Duration::from_secs(35);
 const MAX_DOCTOR_TAG_VALUE_LEN: usize = 256;
 
 /// Redacted doctor report data that can be merged into a feedback upload.
@@ -31,7 +33,7 @@ pub(crate) struct DoctorFeedbackReport {
     pub(crate) tags: BTreeMap<String, String>,
 }
 
-/// Runs `codex --cd <workspace> doctor --json` and returns a best-effort
+/// Runs `codex --cd <workspace> doctor --json --feedback` and returns a best-effort
 /// feedback attachment.
 ///
 /// Failure to spawn Codex, finish before the timeout, or parse JSON means the
@@ -104,12 +106,13 @@ pub(crate) async fn doctor_feedback_report(
 }
 
 fn doctor_command(executable: &Path, cwd: &Path, codex_home: &Path) -> Command {
-    let mut command = Command::new(executable);
+    let mut command = Command::from(codex_utils_process::background_command(executable));
     command
         .arg("--cd")
         .arg(cwd)
         .arg("doctor")
         .arg("--json")
+        .arg("--feedback")
         .current_dir(codex_home)
         .env("CODEX_HOME", codex_home);
     command
@@ -211,7 +214,8 @@ mod tests {
                 "--cd".as_ref(),
                 workspace.as_os_str(),
                 "doctor".as_ref(),
-                "--json".as_ref()
+                "--json".as_ref(),
+                "--feedback".as_ref()
             ]
         );
         assert_eq!(

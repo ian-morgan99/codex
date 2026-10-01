@@ -14,6 +14,7 @@ pub const OPENAI_WORKLOAD_IDENTITY_CONTEXT_ENV_VAR: &str = "OPENAI_WORKLOAD_IDEN
 pub const NON_INHERITABLE_ENV_VARS: &[&str] = &[
     CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR,
     "NODE_REPL_AUTH_TOKEN",
+    "CODEX_GUARDIAN_DECISIONS_API_KEY",
     OPENAI_FEDERATION_RULE_ID_ENV_VAR,
     OPENAI_IDENTITY_TOKEN_FILE_ENV_VAR,
     OPENAI_WORKLOAD_IDENTITY_CONTEXT_ENV_VAR,
@@ -137,6 +138,8 @@ where
 
     // Step 4 - Apply user-provided overrides.
     for (key, val) in &policy.r#set {
+        #[cfg(windows)]
+        env_map.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
         env_map.insert(key.clone(), val.clone());
     }
 
@@ -248,6 +251,21 @@ mod windows_tests {
         ]);
 
         assert_eq!(result, expected);
+
+        let policy = ShellEnvironmentPolicy {
+            inherit: ShellEnvironmentPolicyInherit::All,
+            ignore_default_excludes: true,
+            r#set: HashMap::from([("gh_host".to_string(), "github.trusted.example".to_string())]),
+            ..Default::default()
+        };
+        assert_eq!(
+            populate_env(
+                make_vars(&[("GH_HOST", "github.stale.example")]),
+                &policy,
+                /*thread_id*/ None,
+            ),
+            HashMap::from([("gh_host".to_string(), "github.trusted.example".to_string(),)]),
+        );
     }
 
     #[test]

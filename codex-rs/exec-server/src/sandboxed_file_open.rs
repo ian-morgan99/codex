@@ -3,14 +3,21 @@ use codex_sandboxing::SandboxExecRequest;
 use codex_utils_path_uri::PathUri;
 use tokio::io;
 
+use crate::fs_helper::FsHelperOpenParams;
 use crate::fs_helper::FsHelperOpenResponse;
 use crate::fs_helper::FsHelperPayload;
 use crate::fs_helper::FsHelperRequest;
 use crate::fs_helper::FsHelperResponse;
+#[cfg(windows)]
+use crate::fs_sandbox::drain_helper_stderr;
 use crate::fs_sandbox::io_error;
+#[cfg(windows)]
+use crate::fs_sandbox::read_helper_response;
+#[cfg(windows)]
+use crate::fs_sandbox::reap_helper_after_response;
 use crate::fs_sandbox::spawn_command;
+#[cfg(unix)]
 use crate::fs_sandbox::wait_for_helper_output;
-use crate::protocol::FsReadFileParams;
 use crate::rpc::internal_error;
 use crate::rpc::invalid_request;
 
@@ -18,12 +25,8 @@ pub(crate) async fn open(
     command: SandboxExecRequest,
     path: PathUri,
 ) -> Result<tokio::fs::File, JSONRPCErrorError> {
-    let request = serde_json::to_vec(&FsHelperRequest::Open(FsReadFileParams {
-        path,
-        follow_symlinks: None,
-        sandbox: None,
-    }))
-    .map_err(|error| internal_error(format!("invalid fs sandbox helper request: {error}")))?;
+    let request = serde_json::to_vec(&FsHelperRequest::Open(FsHelperOpenParams { path }))
+        .map_err(|error| internal_error(format!("invalid fs sandbox helper request: {error}")))?;
     open_platform(command, request).await
 }
 
@@ -51,7 +54,7 @@ async fn open_platform(
 
     let (mut receiver, sender) = UnixStream::pair().map_err(io_error)?;
     let sender: OwnedFd = sender.into();
-    let child = spawn_command(command, std::process::Stdio::from(sender))?;
+    let child = spawn_command(command, codex_utils_pty::ChildStdin::File(sender))?;
     receiver.write_all(&request).map_err(io_error)?;
     receiver
         .shutdown(std::net::Shutdown::Write)
@@ -69,10 +72,9 @@ async fn open_platform(
     command: SandboxExecRequest,
     mut request: Vec<u8>,
 ) -> Result<tokio::fs::File, JSONRPCErrorError> {
-    use tokio::io::AsyncBufReadExt;
     use tokio::io::AsyncWriteExt;
 
-    let mut child = spawn_command(command, std::process::Stdio::piped())?;
+    let mut child = spawn_command(command, codex_utils_pty::ChildStdin::Piped)?;
     let mut stdin = child
         .stdin
         .take()
@@ -83,19 +85,17 @@ async fn open_platform(
         .ok_or_else(|| internal_error("missing fs sandbox helper stdout".to_string()))?;
     request.push(b'\n');
     stdin.write_all(&request).await.map_err(io_error)?;
+    stdin.flush().await.map_err(io_error)?;
+    let stderr = drain_helper_stderr(&mut child);
 
     let result = async {
-        let mut response = Vec::new();
-        tokio::io::BufReader::new(stdout)
-            .read_until(b'\n', &mut response)
-            .await
-            .map_err(io_error)?;
+        let response = read_helper_response(stdout).await?;
         let response = open_response(&response)?;
         duplicate_file_handle(response.process_id, response.file_handle).map_err(io_error)
     }
     .await;
     drop(stdin);
-    wait_for_helper_output(child).await?;
+    reap_helper_after_response(child, stderr).await?;
     result.map(tokio::fs::File::from_std)
 }
 
@@ -182,16 +182,16 @@ fn duplicate_file_handle(process_id: u32, file_handle: u64) -> io::Result<std::f
 
     // SAFETY: OpenProcess returns an owned handle or null on failure.
     let process = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, process_id) };
-    if process == 0 {
+    if process.is_null() {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: The successful OpenProcess result is owned by this scope.
-    let process = unsafe { OwnedHandle::from_raw_handle(process as _) };
-    let mut duplicated: HANDLE = 0;
+    let process = unsafe { OwnedHandle::from_raw_handle(process) };
+    let mut duplicated = std::ptr::null_mut();
     // SAFETY: Both process handles remain valid and duplicated receives an owned file handle.
     if unsafe {
         DuplicateHandle(
-            process.as_raw_handle() as HANDLE,
+            process.as_raw_handle(),
             file_handle as HANDLE,
             GetCurrentProcess(),
             &raw mut duplicated,
@@ -204,5 +204,5 @@ fn duplicate_file_handle(process_id: u32, file_handle: u64) -> io::Result<std::f
         return Err(io::Error::last_os_error());
     }
     // SAFETY: DuplicateHandle transferred ownership of the new file handle.
-    Ok(unsafe { std::fs::File::from_raw_handle(duplicated as _) })
+    Ok(unsafe { std::fs::File::from_raw_handle(duplicated) })
 }

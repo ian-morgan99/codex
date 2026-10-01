@@ -9,7 +9,6 @@ use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::RequestId;
-use codex_code_mode_protocol::host::TransportLane;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -42,7 +41,6 @@ pub(super) struct ConnectionDriver {
     event_tx: mpsc::Sender<DriverEvent>,
     execute_claim_rx: mpsc::UnboundedReceiver<RequestId>,
     outgoing_tx: mpsc::Sender<EncodedFrame>,
-    bulk_tx: Option<mpsc::Sender<EncodedFrame>>,
     requests: RequestTracker,
     deferred_host_messages: VecDeque<HostToClient>,
     sessions: SessionRegistry,
@@ -69,7 +67,6 @@ impl ConnectionDriver {
                 event_tx: event_tx.clone(),
                 execute_claim_rx,
                 outgoing_tx,
-                bulk_tx: None,
                 requests: RequestTracker::new(),
                 deferred_host_messages: VecDeque::new(),
                 sessions: SessionRegistry::new(),
@@ -125,6 +122,7 @@ impl ConnectionDriver {
             DriverEvent::HostMessage(message) => self.handle_host_message(message),
             DriverEvent::DelegateCompleted { id, result } => self.complete_delegate(id, result),
             DriverEvent::RequestCancelled(id) => self.cancel_request(id),
+            DriverEvent::YieldRequest(id) => self.yield_request(id),
             DriverEvent::Failed(reason) => {
                 self.fail(reason);
                 false
@@ -137,17 +135,8 @@ impl ConnectionDriver {
         }
     }
 
-    pub(super) fn with_bulk_sender(mut self, sender: mpsc::Sender<EncodedFrame>) -> Self {
-        self.bulk_tx = Some(sender);
-        self
-    }
-
-    fn queue_frame(&mut self, frame: EncodedFrame, lane: TransportLane) -> bool {
-        let sender = match lane {
-            TransportLane::Control => &self.outgoing_tx,
-            TransportLane::Bulk => self.bulk_tx.as_ref().unwrap_or(&self.outgoing_tx),
-        };
-        match sender.try_send(frame) {
+    fn queue_frame(&mut self, frame: EncodedFrame) -> bool {
+        match self.outgoing_tx.try_send(frame) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.fail("code-mode host outgoing queue is full".to_string());

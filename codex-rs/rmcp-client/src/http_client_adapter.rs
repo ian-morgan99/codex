@@ -54,14 +54,13 @@ use rmcp::transport::streamable_http_client::StreamableHttpPostResponse;
 use sse_stream::Sse;
 use sse_stream::SseStream;
 use tokio::sync::oneshot;
+use tracing::Instrument;
 
+use crate::bounded_stdio_transport::MAX_MCP_STDIO_LINE_BYTES;
 use crate::event_notification_transport::MAX_EVENT_NOTIFICATION_BYTES;
 use crate::http_client_redirect::SameOriginRedirectHttpClient;
-use crate::local_stdio_transport::MAX_MCP_STDIO_LINE_BYTES;
 
-mod www_authenticate;
-
-use self::www_authenticate::insufficient_scope_challenge;
+use crate::www_authenticate::insufficient_scope_challenge;
 
 const EVENT_STREAM_MIME_TYPE: &str = "text/event-stream";
 const JSON_MIME_TYPE: &str = "application/json";
@@ -220,7 +219,9 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             None
         };
 
-        let body = serde_json::to_vec(&message).map_err(StreamableHttpError::Deserialize)?;
+        let body = serde_json::to_value(&message).map_err(StreamableHttpError::Deserialize)?;
+        let request_span = crate::trace_context::request_span(&body);
+        let body = serde_json::to_vec(&body).map_err(StreamableHttpError::Deserialize)?;
         let has_authorization_header = headers.contains_key(AUTHORIZATION);
         if let JsonRpcMessage::Notification(notification) = &message
             && let ClientNotification::CancelledNotification(cancelled) = &notification.notification
@@ -235,16 +236,19 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             return Ok(StreamableHttpPostResponse::Accepted);
         }
 
-        let request = self.http_client.http_request_stream(HttpRequestParams {
-            method: "POST".to_string(),
-            url: uri.to_string(),
-            headers: protocol_headers(&headers),
-            body: Some(body.into()),
-            timeout_ms,
-            redirect_policy,
-            request_id: "buffered-request".to_string(),
-            stream_response: true,
-        });
+        let request = self
+            .http_client
+            .http_request_stream(HttpRequestParams {
+                method: "POST".to_string(),
+                url: uri.to_string(),
+                headers: protocol_headers(&headers),
+                body: Some(body.into()),
+                timeout_ms,
+                redirect_policy,
+                request_id: "buffered-request".to_string(),
+                stream_response: true,
+            })
+            .instrument(request_span);
         let response = if is_event_stream_request {
             tokio::time::timeout(EVENT_STREAM_RESPONSE_TIMEOUT, request)
                 .await
@@ -277,12 +281,19 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 StreamableHttpClientAdapterError::SessionExpired404,
             ));
         }
-        if response.status == StatusCode::UNAUTHORIZED.as_u16()
-            && let Some(header) = response_header(&response.headers, WWW_AUTHENTICATE)
-        {
-            return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
-                header,
-            )));
+        if response.status == StatusCode::UNAUTHORIZED.as_u16() {
+            let challenges = response
+                .headers
+                .iter()
+                .filter(|header| header.name.eq_ignore_ascii_case(WWW_AUTHENTICATE.as_str()))
+                .map(|header| header.value.as_str())
+                .collect::<Vec<_>>();
+            if !challenges.is_empty() {
+                // RFC 9110 allows combining these list-based fields; keep challenges after the first.
+                return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
+                    challenges.join(", "),
+                )));
+            }
         }
         if response.status == StatusCode::FORBIDDEN.as_u16()
             && let Some(challenge) = insufficient_scope_challenge(&response.headers)
@@ -785,7 +796,7 @@ fn mcp_redirect_policy(
 // rmcp's automatic lifecycle does not yet recognize deployed legacy discovery
 // rejection shapes. Remove this compatibility shim once the SDK does:
 // https://github.com/modelcontextprotocol/rust-sdk/issues/1040
-fn legacy_discovery_fallback_response(
+pub(super) fn legacy_discovery_fallback_response(
     request: &ClientJsonRpcMessage,
     response: ServerJsonRpcMessage,
     allow_uncorrelated_http_rejection: bool,

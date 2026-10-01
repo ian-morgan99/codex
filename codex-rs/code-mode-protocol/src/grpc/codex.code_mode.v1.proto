@@ -29,6 +29,10 @@ service CodeModeHost {
   rpc Execute(ExecuteRequest) returns (stream ExecuteEvent);
   rpc Wait(WaitRequest) returns (WaitResponse);
 
+  // Ends the current observation early without stopping its cell. The
+  // corresponding Execute or Wait still returns its ordinary outcome.
+  rpc YieldObservation(YieldObservationRequest) returns (YieldObservationResponse);
+
   // Acknowledges that a canceled wait has retired before another wait starts.
   rpc CancelWait(CancelWaitRequest) returns (CancelWaitResponse);
   rpc Terminate(TerminateRequest) returns (WaitResponse);
@@ -82,6 +86,11 @@ message ToolCall {
 
   // Starts at one and increases independently for each execution.
   uint64 sequence = 9;
+
+  // The host tool invocation span's W3C parent context for this streamed callback.
+  // gRPC metadata is fixed when the subscription stream opens, so each call
+  // carries its own context in the message.
+  optional string traceparent = 10;
 }
 
 message CompleteToolCallRequest {
@@ -184,6 +193,16 @@ message CancelWaitRequest {
 
 message CancelWaitResponse {}
 
+message YieldObservationRequest {
+  string session_id = 1;
+  oneof observation {
+    string execution_id = 2;
+    string wait_id = 3;
+  }
+}
+
+message YieldObservationResponse {}
+
 message TerminateRequest {
   string session_id = 1;
   string cell_id = 2;
@@ -192,6 +211,12 @@ message TerminateRequest {
 message ExecutionOutcome {
   string cell_id = 1;
   repeated ContentItem content_items = 2;
+
+  // Elapsed monotonic time from receipt of this Execute, Wait, or Terminate
+  // request until its outcome is ready, before serialization and delivery.
+  // Includes nested tool waits, but not background time between requests.
+  // Always supplied by the host; zero is a valid measurement.
+  uint64 code_mode_host_duration_ns = 6;
 
   oneof outcome {
     ExecutionYielded yielded = 3;

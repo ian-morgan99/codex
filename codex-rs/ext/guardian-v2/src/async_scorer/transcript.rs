@@ -1,69 +1,62 @@
-use std::collections::HashMap;
-use std::collections::VecDeque;
-
+use codex_extension_api::ConversationHistorySnapshot;
 use codex_extension_api::ResponseItem;
 pub(crate) use codex_features::GuardianV2TranscriptSource as TranscriptSource;
-use codex_protocol::models::ContentItem;
-use codex_protocol::models::FunctionCallOutputContentItem;
-use codex_protocol::models::ImageDetail;
-use codex_protocol::models::ReasoningItemContent;
-use codex_protocol::models::ReasoningItemReasoningSummary;
-use codex_protocol::models::plaintext_agent_message_content;
-use codex_protocol::protocol::TruncationPolicy;
+use codex_guardian_context::CollectedContext;
+use codex_guardian_context::ComposedContext;
+use codex_guardian_context::ContextPresentation;
+use codex_guardian_context::ContextProfile;
+use codex_guardian_context::ContextTarget;
+use codex_guardian_context::ConversationTranscriptConfig;
+use codex_guardian_context::ConversationTranscriptOptions;
+use codex_guardian_context::GuardianRootMessage;
+#[cfg(test)]
+use codex_guardian_context::MANUAL_APPROVAL_DEVELOPER_PREFIX;
+use codex_guardian_context::PlannedAction;
+use codex_guardian_context::PreviousReviews;
+use codex_guardian_context::SectionError;
+use codex_guardian_context::SectionHistory;
+use codex_guardian_context::SectionInput;
+use codex_guardian_context::TranscriptCursor;
+use codex_guardian_context::TranscriptEntryLimits;
+use codex_guardian_context::TranscriptImageInput;
+use codex_guardian_context::TranscriptMode;
+use codex_guardian_context::TranscriptRetentionConfig;
+use codex_guardian_context::TranscriptSelection;
+use codex_guardian_context::TrustedTool;
+use codex_guardian_context::default_registry;
 
-pub(crate) const MAX_MESSAGE_ENTRY_TOKENS: usize = 2_000;
-pub(crate) const MAX_TOOL_ENTRY_TOKENS: usize = 1_000;
-pub(crate) const MAX_MESSAGE_TRANSCRIPT_TOKENS: usize = 10_000;
-pub(crate) const MAX_TOOL_TRANSCRIPT_TOKENS: usize = 10_000;
-pub(crate) const MAX_RECENT_NON_USER_ENTRIES: usize = 40;
-const MAX_TRANSCRIPT_IMAGES: usize = 4;
-const MAX_TRANSCRIPT_IMAGE_BYTES: usize = 8 * 1024 * 1024;
-const MANUAL_APPROVAL_DEVELOPER_PREFIX: &str =
-    "The user has manually approved a specific action that was previously `Rejected`.";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TranscriptEntryKind {
-    User,
-    Message,
-    Tool,
+pub(crate) const MAX_MESSAGE_ENTRY_TOKENS: usize = ContextProfile::asynchronous()
+    .transcript
+    .entry_limits
+    .message_tokens;
+pub(crate) const MAX_TOOL_ENTRY_TOKENS: usize = ContextProfile::asynchronous()
+    .transcript
+    .entry_limits
+    .tool_tokens;
+pub(crate) const MAX_MESSAGE_TRANSCRIPT_TOKENS: usize = ContextProfile::asynchronous()
+    .retention
+    .max_message_transcript_tokens;
+pub(crate) const MAX_TOOL_TRANSCRIPT_TOKENS: usize = ContextProfile::asynchronous()
+    .retention
+    .max_tool_transcript_tokens;
+pub(crate) const MAX_RECENT_NON_USER_ENTRIES: usize = ContextProfile::asynchronous()
+    .retention
+    .max_recent_non_user_entries;
+/// Host snapshot and evidence borrowed for a single section collection.
+pub(crate) struct ContextInput<'a> {
+    pub(crate) target: ContextTarget,
+    pub(crate) history: &'a dyn ConversationHistorySnapshot,
+    pub(crate) root_conversation: &'a [GuardianRootMessage],
+    pub(crate) trusted_user_answers: &'a [String],
+    pub(crate) planned_action: Option<&'a PlannedAction>,
+    pub(crate) permissions: Option<&'a codex_guardian_context::PermissionContext>,
+    pub(crate) previous_reviews: Option<&'a PreviousReviews>,
+    pub(crate) trusted_tool: Option<&'a TrustedTool>,
+    pub(crate) trusted_skill_paths: &'a [String],
+    pub(crate) node_repl_images: Option<&'a [codex_protocol::models::ContentItem]>,
 }
 
-struct TranscriptEntry {
-    kind: TranscriptEntryKind,
-    text: String,
-    tokens: usize,
-}
-
-fn retained_tokens(
-    entries: &[TranscriptEntry],
-    retained: &VecDeque<usize>,
-    kind: TranscriptEntryKind,
-) -> usize {
-    retained
-        .iter()
-        .filter_map(|&index| {
-            let entry = &entries[index];
-            (entry.kind == kind).then_some(entry.tokens)
-        })
-        .sum()
-}
-
-fn evict_oldest_matching(
-    entries: &[TranscriptEntry],
-    retained: &mut VecDeque<usize>,
-    count: usize,
-    mut matches: impl FnMut(TranscriptEntryKind) -> bool,
-) {
-    let mut remaining = count;
-    retained.retain(|&index| {
-        if remaining > 0 && matches(entries[index].kind) {
-            remaining -= 1;
-            false
-        } else {
-            true
-        }
-    });
-}
+pub(crate) type RenderedContext = ComposedContext;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TranscriptConfig {
@@ -80,7 +73,7 @@ impl Default for TranscriptConfig {
     fn default() -> Self {
         Self {
             sources: vec![TranscriptSource::ToolCalls, TranscriptSource::ToolOutputs],
-            include_images: false,
+            include_images: ContextProfile::asynchronous().include_images,
             max_message_entry_tokens: MAX_MESSAGE_ENTRY_TOKENS,
             max_tool_entry_tokens: MAX_TOOL_ENTRY_TOKENS,
             max_message_transcript_tokens: MAX_MESSAGE_TRANSCRIPT_TOKENS,
@@ -91,389 +84,143 @@ impl Default for TranscriptConfig {
 }
 
 impl TranscriptConfig {
-    pub(crate) fn images<'a>(
+    pub(crate) fn build_context(
         &self,
-        items: impl IntoIterator<Item = &'a ResponseItem>,
-        node_repl_images: impl IntoIterator<Item = ContentItem>,
-    ) -> Vec<ContentItem> {
-        if !self.include_images {
-            return Vec::new();
-        }
-
-        let mut images = VecDeque::new();
-        let mut image_bytes = 0usize;
-        let mut include_image = |image_url: &str, detail: Option<ImageDetail>| {
-            if image_url.len() > MAX_TRANSCRIPT_IMAGE_BYTES {
-                return;
-            }
-            while images.len() >= MAX_TRANSCRIPT_IMAGES
-                || image_bytes + image_url.len() > MAX_TRANSCRIPT_IMAGE_BYTES
-            {
-                let Some(ContentItem::InputImage { image_url, .. }) = images.pop_front() else {
-                    break;
-                };
-                image_bytes -= image_url.len();
-            }
-            image_bytes += image_url.len();
-            images.push_back(ContentItem::InputImage {
-                image_url: image_url.to_owned(),
-                detail,
-            });
-        };
-
-        for item in items {
-            match item {
-                ResponseItem::Message { role, content, .. }
-                    if matches!(role.as_str(), "user" | "assistant") =>
-                {
-                    for item in content {
-                        if let ContentItem::InputImage { image_url, detail } = item {
-                            include_image(image_url, *detail);
-                        }
-                    }
-                }
-                ResponseItem::FunctionCallOutput { output, .. }
-                | ResponseItem::CustomToolCallOutput { output, .. }
-                    if self.sources.contains(&TranscriptSource::ToolOutputs) =>
-                {
-                    if let Some(content) = output.content_items() {
-                        for item in content {
-                            if let FunctionCallOutputContentItem::InputImage { image_url, detail } =
-                                item
-                            {
-                                include_image(image_url, *detail);
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        if self.sources.contains(&TranscriptSource::ToolOutputs) {
-            for image in node_repl_images {
-                if let ContentItem::InputImage { image_url, detail } = image {
-                    include_image(&image_url, detail);
-                }
-            }
-        }
-
-        images.into_iter().collect()
+        input: ContextInput<'_>,
+    ) -> Result<RenderedContext, SectionError> {
+        let (mut context, _) = self.collect_context(input)?.compose(/*cursor*/ None, &[])?;
+        context.deduplicate_transcript_instructions();
+        Ok(context)
     }
 
-    pub(crate) fn build<'a>(
+    pub(super) fn collect_context(
         &self,
-        items: impl IntoIterator<Item = &'a ResponseItem>,
-    ) -> Vec<String> {
-        let mut entries = Vec::new();
-        let mut tool_names_by_call_id = HashMap::new();
-
-        for item in items {
-            let (role, text) = match item {
-                ResponseItem::Message { role, content, .. } => {
-                    let text = content
-                        .iter()
-                        .filter_map(|item| match item {
-                            ContentItem::InputText { text } | ContentItem::OutputText { text }
-                                if !text.is_empty() =>
-                            {
-                                Some(text.as_str())
-                            }
-                            ContentItem::InputText { .. }
-                            | ContentItem::OutputText { .. }
-                            | ContentItem::InputImage { .. }
-                            | ContentItem::InputAudio { .. } => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if text.trim().is_empty() {
-                        continue;
-                    }
-                    let include_message = match role.as_str() {
-                        "user" | "assistant" => true,
-                        "developer" => text.starts_with(MANUAL_APPROVAL_DEVELOPER_PREFIX),
-                        _ => false,
-                    };
-                    if !include_message {
-                        continue;
-                    }
-                    (role.clone(), text)
-                }
-                ResponseItem::AgentMessage {
-                    author, content, ..
-                } => {
-                    let Some(text) = plaintext_agent_message_content(content) else {
-                        continue;
-                    };
-                    (
-                        "assistant".to_owned(),
-                        format!("Agent message from {author}:\n{text}"),
-                    )
-                }
-                ResponseItem::FunctionCall {
-                    name,
-                    arguments,
-                    call_id,
-                    ..
-                }
-                | ResponseItem::CustomToolCall {
-                    name,
-                    input: arguments,
-                    call_id,
-                    ..
-                } => {
-                    tool_names_by_call_id.insert(call_id.as_str(), name.as_str());
-                    if !self.sources.contains(&TranscriptSource::ToolCalls) {
-                        continue;
-                    }
-                    (format!("tool {name} call"), arguments.clone())
-                }
-                ResponseItem::FunctionCallOutput {
-                    call_id: Some(call_id),
-                    output,
-                    ..
-                }
-                | ResponseItem::CustomToolCallOutput {
-                    call_id, output, ..
-                } => {
-                    if !self.sources.contains(&TranscriptSource::ToolOutputs) {
-                        continue;
-                    }
-                    let Some(output) = output.body.to_text() else {
-                        continue;
-                    };
-                    let role = tool_names_by_call_id.get(call_id.as_str()).map_or_else(
-                        || "tool result".to_owned(),
-                        |name| format!("tool {name} result"),
-                    );
-                    (role, output)
-                }
-                ResponseItem::FunctionCallOutput {
-                    call_id: None,
-                    name,
-                    namespace,
-                    output,
-                    ..
-                } => {
-                    if !self.sources.contains(&TranscriptSource::ToolOutputs) {
-                        continue;
-                    }
-                    let output = output
-                        .body
-                        .to_text()
-                        .unwrap_or_else(|| "[non-text output]".into());
-                    let role = match (name.as_deref(), namespace.as_deref()) {
-                        (Some(name), Some(namespace)) => {
-                            format!("tool {namespace}.{name} result")
-                        }
-                        (Some(name), None) => format!("tool {name} result"),
-                        (None, _) => "tool result".to_owned(),
-                    };
-                    (role, output)
-                }
-                ResponseItem::Reasoning {
-                    summary, content, ..
-                } => {
-                    if !self.sources.contains(&TranscriptSource::Reasoning) {
-                        continue;
-                    }
-                    let text = summary
-                        .iter()
-                        .map(|item| match item {
-                            ReasoningItemReasoningSummary::SummaryText { text } => text.as_str(),
-                        })
-                        .chain(content.iter().flatten().map(|item| match item {
-                            ReasoningItemContent::ReasoningText { text }
-                            | ReasoningItemContent::Text { text } => text.as_str(),
-                        }))
-                        .filter(|text| !text.trim().is_empty())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    ("reasoning".to_owned(), text)
-                }
-                ResponseItem::LocalShellCall { action, .. } => {
-                    if !self.sources.contains(&TranscriptSource::ToolCalls) {
-                        continue;
-                    }
-                    let Ok(text) = serde_json::to_string(action) else {
-                        continue;
-                    };
-                    ("tool shell call".to_owned(), text)
-                }
-                ResponseItem::WebSearchCall { action, .. } => {
-                    if !self.sources.contains(&TranscriptSource::ToolCalls) {
-                        continue;
-                    }
-                    let Some(action) = action else {
-                        continue;
-                    };
-                    let Ok(text) = serde_json::to_string(action) else {
-                        continue;
-                    };
-                    ("tool web_search call".to_owned(), text)
-                }
-                ResponseItem::AdditionalTools { .. }
-                | ResponseItem::ImageGenerationCall { .. }
-                | ResponseItem::ToolSearchCall { .. }
-                | ResponseItem::ToolSearchOutput { .. }
-                | ResponseItem::Compaction { .. }
-                | ResponseItem::CompactionTrigger { .. }
-                | ResponseItem::ContextCompaction { .. }
-                | ResponseItem::Other => continue,
-            };
-            if text.trim().is_empty() {
-                continue;
-            }
-
-            let kind = match role.as_str() {
-                "user" => TranscriptEntryKind::User,
-                role if role.starts_with("tool ") => TranscriptEntryKind::Tool,
-                _ => TranscriptEntryKind::Message,
-            };
-            let token_cap = match kind {
-                TranscriptEntryKind::Tool => self.max_tool_entry_tokens,
-                TranscriptEntryKind::User | TranscriptEntryKind::Message => {
-                    self.max_message_entry_tokens
-                }
-            };
-            let text = truncate_entry(&text, token_cap);
-            let entry_number = entries.len() + 1;
-            let text = format!("[{entry_number}] {role}: {text}\n");
-            let tokens = TruncationPolicy::Bytes(text.len()).token_budget();
-            entries.push(TranscriptEntry { kind, text, tokens });
-        }
-
-        let mut included = vec![false; entries.len()];
-        let mut message_tokens = 0;
-        let user_indices = entries
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| (entry.kind == TranscriptEntryKind::User).then_some(index))
-            .collect::<Vec<_>>();
-
-        if let Some(&first_user_index) = user_indices.first() {
-            included[first_user_index] = true;
-            message_tokens += entries[first_user_index].tokens;
-        }
-
-        if let Some(&latest_user_index) = user_indices.last()
-            && !included[latest_user_index]
-            && message_tokens + entries[latest_user_index].tokens
-                <= self.max_message_transcript_tokens
-        {
-            included[latest_user_index] = true;
-            message_tokens += entries[latest_user_index].tokens;
-        }
-
-        for &index in user_indices.iter().rev() {
-            if included[index]
-                || message_tokens + entries[index].tokens > self.max_message_transcript_tokens
-            {
-                continue;
-            }
-
-            included[index] = true;
-            message_tokens += entries[index].tokens;
-        }
-
-        let available_message_tokens = self
-            .max_message_transcript_tokens
-            .saturating_sub(message_tokens);
-        let mut retained_non_user = VecDeque::new();
-
-        // Replay the transcript as an append-only bounded buffer. When a new entry would overflow
-        // a budget, remove half of the existing entries in that pool before appending it. This
-        // keeps the retained prefix stable between overflow points without storing sampler state.
-        for (index, entry) in entries.iter().enumerate() {
-            if entry.kind == TranscriptEntryKind::User {
-                continue;
-            }
-
-            let token_budget = match entry.kind {
-                TranscriptEntryKind::Tool => self.max_tool_transcript_tokens,
-                TranscriptEntryKind::Message => available_message_tokens,
-                TranscriptEntryKind::User => unreachable!("user entries were selected separately"),
-            };
-
-            // An entry that cannot fit on its own must not evict retained evidence.
-            if entry.tokens > token_budget || self.max_recent_non_user_entries == 0 {
-                continue;
-            }
-
-            if retained_tokens(&entries, &retained_non_user, entry.kind)
-                .saturating_add(entry.tokens)
-                > token_budget
-            {
-                let retained_kind_count = retained_non_user
-                    .iter()
-                    .filter(|&&retained_index| entries[retained_index].kind == entry.kind)
-                    .count();
-                evict_oldest_matching(
-                    &entries,
-                    &mut retained_non_user,
-                    retained_kind_count.div_ceil(2),
-                    |kind| kind == entry.kind,
-                );
-                while retained_tokens(&entries, &retained_non_user, entry.kind)
-                    .saturating_add(entry.tokens)
-                    > token_budget
-                {
-                    evict_oldest_matching(
-                        &entries,
-                        &mut retained_non_user,
-                        /*count*/ 1,
-                        |kind| kind == entry.kind,
-                    );
-                }
-            }
-
-            if retained_non_user.len().saturating_add(1) > self.max_recent_non_user_entries {
-                let entries_to_evict = retained_non_user.len().div_ceil(2);
-                evict_oldest_matching(&entries, &mut retained_non_user, entries_to_evict, |_| true);
-            }
-
-            retained_non_user.push_back(index);
-        }
-
-        for index in retained_non_user {
-            included[index] = true;
-        }
-
-        entries
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, entry)| included[index].then_some(entry.text))
-            .collect()
+        input: ContextInput<'_>,
+    ) -> Result<CollectedTranscript, SectionError> {
+        let ContextInput {
+            target,
+            history,
+            root_conversation,
+            trusted_user_answers,
+            planned_action,
+            permissions,
+            previous_reviews,
+            trusted_tool,
+            trusted_skill_paths,
+            node_repl_images,
+        } = input;
+        let history_version = history.review_history_version();
+        let history = SnapshotHistory(history);
+        let profile = ContextProfile {
+            target: ContextTarget::Async,
+            include_images: self.include_images,
+            retention: TranscriptRetentionConfig {
+                max_message_transcript_tokens: self.max_message_transcript_tokens,
+                max_tool_transcript_tokens: self.max_tool_transcript_tokens,
+                max_recent_non_user_entries: self.max_recent_non_user_entries,
+            },
+            transcript: ConversationTranscriptConfig {
+                options: ConversationTranscriptOptions {
+                    include_tool_calls: self.sources.contains(&TranscriptSource::ToolCalls),
+                    include_tool_outputs: self.sources.contains(&TranscriptSource::ToolOutputs),
+                    include_reasoning: self.sources.contains(&TranscriptSource::Reasoning),
+                },
+                entry_limits: TranscriptEntryLimits {
+                    message_tokens: self.max_message_entry_tokens,
+                    tool_tokens: self.max_tool_entry_tokens,
+                    node_repl_output_tokens: self.max_tool_entry_tokens,
+                },
+            },
+        };
+        let context = default_registry().prepare(&SectionInput {
+            target,
+            history: &history,
+            transcript: &profile.transcript,
+            root_conversation,
+            trusted_user_answers,
+            planned_action,
+            permissions,
+            previous_reviews,
+            trusted_tool,
+            trusted_skill_paths,
+            images: node_repl_images.map(|node_repl_images| TranscriptImageInput {
+                enabled: profile.include_images,
+                include_tool_outputs: profile.transcript.options.include_tool_outputs,
+                node_repl_images,
+            }),
+            node_repl: None,
+        })?;
+        Ok(CollectedTranscript {
+            context,
+            profile,
+            history_version,
+        })
     }
 }
 
-pub(crate) fn truncate_entry(text: &str, max_tokens: usize) -> String {
-    let max_bytes = TruncationPolicy::Tokens(max_tokens).byte_budget();
-    if text.len() <= max_bytes {
-        return text.to_owned();
+/// Captured evidence stays typed until the owning conversation selects its delta.
+#[derive(Clone)]
+pub(super) struct CollectedTranscript {
+    context: CollectedContext,
+    profile: ContextProfile,
+    history_version: u64,
+}
+
+impl CollectedTranscript {
+    pub(super) fn select(
+        &self,
+        cursor: Option<TranscriptCursor>,
+    ) -> (TranscriptSelection<'_>, TranscriptCursor) {
+        let mode = cursor.map_or(TranscriptMode::Full, |cursor| TranscriptMode::Delta {
+            cursor,
+        });
+        mode.select(self.context.transcript_entries(), self.history_version)
     }
 
-    let omitted_tokens =
-        TruncationPolicy::Bytes(text.len().saturating_sub(max_bytes)).token_budget();
-    let marker = format!("<truncated omitted_approx_tokens=\"{omitted_tokens}\" />");
-    if max_bytes <= marker.len() {
-        return marker;
+    pub(super) fn compose(
+        mut self,
+        cursor: Option<TranscriptCursor>,
+        reviewer_history: &[codex_history::ResponseItemEnvelope],
+    ) -> Result<(ComposedContext, TranscriptCursor), SectionError> {
+        self.context.retain_new_reviews(reviewer_history);
+        let (selection, next) = self.select(cursor);
+        let (entries, offset, presentation) = match selection {
+            TranscriptSelection::Full(entries) => (entries, 0, ContextPresentation::Async),
+            TranscriptSelection::Delta { entries, offset } => {
+                (entries, offset, ContextPresentation::AsyncDelta)
+            }
+        };
+        let transcript = self.profile.render_transcript(entries, offset);
+        let context = self.context.compose(presentation, transcript)?;
+        Ok((context, next))
+    }
+}
+
+struct SnapshotHistory<'a>(&'a dyn ConversationHistorySnapshot);
+
+impl SectionHistory for SnapshotHistory<'_> {
+    fn retained_context(&self) -> Option<&codex_history::RetainedContext> {
+        self.0.retained_context()
     }
 
-    let available_bytes = max_bytes - marker.len();
-    let prefix_bytes = available_bytes / 2;
-    let suffix_bytes = available_bytes - prefix_bytes;
-
-    let mut prefix_end = prefix_bytes;
-    while !text.is_char_boundary(prefix_end) {
-        prefix_end -= 1;
+    fn items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
+        Box::new(self.items_with_sources().map(|(item, _)| item))
     }
 
-    let mut suffix_start = text.len() - suffix_bytes;
-    while !text.is_char_boundary(suffix_start) {
-        suffix_start += 1;
+    fn items_with_sources(
+        &self,
+    ) -> Box<dyn Iterator<Item = (&ResponseItem, Option<&codex_history::RetainedSource>)> + Send + '_>
+    {
+        self.0.review_items_with_sources()
     }
 
-    format!("{}{marker}{}", &text[..prefix_end], &text[suffix_start..])
+    fn render_retained_assistant(
+        &self,
+        message: &codex_history::RetainedUserMessage,
+    ) -> Option<GuardianRootMessage> {
+        codex_core::context::render_retained_assistant_context(message)
+            .map(GuardianRootMessage::Assistant)
+    }
 }
 
 #[cfg(test)]

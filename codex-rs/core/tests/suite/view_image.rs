@@ -280,7 +280,9 @@ async fn assert_user_turn_local_image_resizes_to(
     )
     .await;
 
-    let body = mock.single_request().body_json();
+    let request = mock.single_request();
+    assert!(request.has_content_kinds(&["user.text", "user.image", "user.text"]));
+    let body = request.body_json();
     let input = body
         .get("input")
         .and_then(Value::as_array)
@@ -303,6 +305,7 @@ async fn assert_user_turn_local_image_resizes_to(
             assert_eq!(resize_notice_indices, Vec::<usize>::new());
         }
         ResizeNoticeExpectation::Enabled => {
+            assert!(request.has_content_kinds(&["images.resize_notice"]));
             assert_eq!(resize_notice_indices, vec![image_message_index + 1]);
             assert_developer_text_message(
                 &input[image_message_index + 1],
@@ -836,12 +839,12 @@ async fn view_image_routes_to_selected_remote_environment() -> anyhow::Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn view_image_tool_can_preserve_original_resolution_when_requested_on_gpt5_4()
+async fn view_image_tool_can_preserve_original_resolution_when_requested_on_gpt5_5()
 -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.4");
+    let mut builder = test_codex().with_model("gpt-5.5");
     let test = builder.build_with_auto_env(&server).await?;
     let TestCodex {
         codex,
@@ -932,7 +935,7 @@ async fn view_image_unified_budget_hides_detail_but_accepts_legacy_hints() -> an
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
+    let mut builder = test_codex().with_model("gpt-5.5").with_config(|config| {
         let _ = config.features.enable(Feature::UnifiedImageBudget);
     });
     let test = builder.build_with_auto_env(&server).await?;
@@ -1008,7 +1011,7 @@ async fn view_image_tool_errors_clearly_for_unsupported_detail_values() -> anyho
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.4");
+    let mut builder = test_codex().with_model("gpt-5.5");
     let test = builder.build_with_auto_env(&server).await?;
     let TestCodex {
         codex,
@@ -1086,7 +1089,7 @@ async fn view_image_tool_treats_null_detail_as_omitted() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.4");
+    let mut builder = test_codex().with_model("gpt-5.5");
     let test = builder.build_with_auto_env(&server).await?;
     let TestCodex {
         codex,
@@ -1289,7 +1292,7 @@ async fn view_image_tool_does_not_force_original_resolution_with_capability_only
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.4");
+    let mut builder = test_codex().with_model("gpt-5.5");
     let test = builder.build_with_auto_env(&server).await?;
     let TestCodex {
         codex,
@@ -1619,17 +1622,22 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
         input_modalities: vec![InputModality::Text],
         used_fallback_model_metadata: false,
         supports_search_tool: false,
+        supports_experimental_context: false,
         use_responses_lite: false,
+        supports_reasoning_effort_updates: false,
+        guardian: None,
         node_repl_auto_review_required: false,
         node_repl_disabled: false,
         auto_review_model_override: None,
         model_specialty: None,
         tool_mode: None,
         multi_agent_version: None,
+        multi_agent_reasoning_effort: None,
         priority: 1,
         additional_speed_tiers: Vec::new(),
         service_tiers: Vec::new(),
         default_service_tier: None,
+        available_access_programs: None,
         upgrade: None,
         model_messages: None,
         include_skills_usage_instructions: false,

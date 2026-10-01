@@ -1,5 +1,6 @@
 use super::*;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::SearchToolCallParams;
 use core_test_support::assert_regex_match;
 use pretty_assertions::assert_eq;
@@ -96,6 +97,7 @@ fn mcp_tool_output_response_item_includes_wall_time() {
             meta: None,
         },
         tool_input: json!({}),
+        result_metadata_capture_allowed: false,
         wall_time: std::time::Duration::from_millis(1250),
         original_image_detail_supported: false,
         truncation_policy: TruncationPolicy::Bytes(1024),
@@ -108,29 +110,23 @@ fn mcp_tool_output_response_item_includes_wall_time() {
         },
     );
 
-    match response {
-        ResponseInputItem::FunctionCallOutput { call_id, output } => {
-            assert_eq!(call_id, "mcp-call-1");
-            assert_eq!(output.success, Some(true));
-            let Some(text) = output.body.to_text() else {
-                panic!("MCP output should serialize as text");
-            };
-            let Some(payload) = text.strip_prefix("Wall time: 1.2500 seconds\nOutput:\n") else {
-                panic!("MCP output should include wall-time header: {text}");
-            };
-            let parsed: serde_json::Value = serde_json::from_str(payload).unwrap_or_else(|err| {
-                panic!("MCP output should serialize JSON content: {err}");
-            });
-            assert_eq!(
-                parsed,
-                json!([{
-                    "type": "text",
-                    "text": "done",
-                }])
-            );
+    assert_eq!(
+        response,
+        ResponseInputItem::FunctionCallOutput {
+            call_id: "mcp-call-1".to_string(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::ContentItems(vec![
+                    FunctionCallOutputContentItem::InputText {
+                        text: "Wall time: 1.2500 seconds\nOutput:".to_string(),
+                    },
+                    FunctionCallOutputContentItem::InputText {
+                        text: "done".to_string(),
+                    },
+                ]),
+                success: Some(true),
+            },
         }
-        other => panic!("expected FunctionCallOutput, got {other:?}"),
-    }
+    );
 }
 
 #[test]
@@ -148,6 +144,7 @@ fn mcp_tool_output_response_item_truncates_large_structured_content() {
             meta: None,
         },
         tool_input: json!({}),
+        result_metadata_capture_allowed: false,
         wall_time: std::time::Duration::from_millis(1250),
         original_image_detail_supported: false,
         truncation_policy: TruncationPolicy::Bytes(128),
@@ -198,6 +195,7 @@ fn mcp_tool_output_response_item_preserves_content_items() {
             meta: None,
         },
         tool_input: json!({}),
+        result_metadata_capture_allowed: false,
         wall_time: std::time::Duration::from_millis(500),
         original_image_detail_supported: false,
         truncation_policy: TruncationPolicy::Bytes(1024),
@@ -220,7 +218,9 @@ fn mcp_tool_output_response_item_preserves_content_items() {
                             text: "Wall time: 0.5000 seconds\nOutput:".to_string(),
                         },
                         FunctionCallOutputContentItem::InputImage {
-                            image_url: image_url.to_string(),
+                            image: ImageReference::Inline {
+                                image_url: image_url.to_string()
+                            },
                             detail: Some(DEFAULT_IMAGE_DETAIL),
                         },
                     ]
@@ -236,8 +236,11 @@ fn mcp_tool_output_response_item_preserves_content_items() {
     }
 }
 
-#[test]
-fn mcp_tool_output_code_mode_result_preserves_content_without_private_metadata() {
+#[test_case::test_case(TruncationPolicy::Bytes(64); "byte budget")]
+#[test_case::test_case(TruncationPolicy::Tokens(1); "token budget")]
+fn mcp_tool_output_code_mode_result_preserves_content_without_private_metadata(
+    truncation_policy: TruncationPolicy,
+) {
     let large_content = "large structured value ".repeat(1_000);
     let output = McpToolOutput {
         result: CallToolResult {
@@ -254,14 +257,16 @@ fn mcp_tool_output_code_mode_result_preserves_content_without_private_metadata()
             })),
         },
         tool_input: json!({}),
+        result_metadata_capture_allowed: false,
         wall_time: std::time::Duration::from_millis(1250),
         original_image_detail_supported: false,
-        truncation_policy: TruncationPolicy::Bytes(64),
+        truncation_policy,
     };
 
-    let result = output.code_mode_result(&ToolPayload::Function {
+    let payload = ToolPayload::Function {
         arguments: "{}".to_string(),
-    });
+    };
+    let result = output.code_mode_result(&payload);
 
     assert_eq!(
         result,
@@ -293,7 +298,9 @@ fn custom_tool_calls_can_derive_text_from_content_items() {
                 text: "line 1".to_string(),
             },
             FunctionCallOutputContentItem::InputImage {
-                image_url: "data:image/png;base64,AAA".to_string(),
+                image: ImageReference::Inline {
+                    image_url: "data:image/png;base64,AAA".to_string(),
+                },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             FunctionCallOutputContentItem::InputText {
@@ -313,7 +320,9 @@ fn custom_tool_calls_can_derive_text_from_content_items() {
                     text: "line 1".to_string(),
                 },
                 FunctionCallOutputContentItem::InputImage {
-                    image_url: "data:image/png;base64,AAA".to_string(),
+                    image: ImageReference::Inline {
+                        image_url: "data:image/png;base64,AAA".to_string(),
+                    },
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 },
                 FunctionCallOutputContentItem::InputText {

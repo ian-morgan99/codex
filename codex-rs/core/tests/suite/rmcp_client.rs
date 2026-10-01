@@ -26,7 +26,9 @@ use codex_config::types::OAuthCredentialsStoreMode;
 use codex_core::EnvironmentConfig;
 use codex_core::EnvironmentMcpPolicy;
 use codex_core::TurnInputRequest;
+use codex_core::X_CODEX_ROUTING_HINT_HEADER;
 use codex_core::config::Config;
+use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::Environment;
 use codex_exec_server::HttpRedirectPolicy;
@@ -36,6 +38,7 @@ use codex_http_client::HttpClientBuilder;
 use codex_login::CodexAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::MCP_SANDBOX_STATE_META_CAPABILITY;
+use codex_mcp::McpProtocolMode;
 use codex_mcp::SandboxState;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_utils_path_uri::LegacyAppPathString;
@@ -44,21 +47,34 @@ use codex_history::RolloutItem;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Settings;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::mcp_policy::McpServerIdentity;
 use codex_protocol::mcp_policy::McpServerRequirement;
 use codex_protocol::mcp_policy::PluginMcpRequirements;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ImageDetail;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::PermissionProfileSnapshot;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ConfigShellToolType;
+use codex_protocol::openai_models::ConfirmationPolicies;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelServiceTier;
 use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffortPreset;
+use codex_protocol::openai_models::ToolMode;
 use codex_protocol::openai_models::TruncationPolicyConfig;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSpecialPath;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::EventMsg;
@@ -70,6 +86,11 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::TurnEnvironmentSelections;
+use codex_protocol::protocol::TurnSettingsUpdate;
+use codex_protocol::protocol::TurnSettingsUpdateOutcome;
+use codex_protocol::request_user_input::RequestUserInputAnswer;
+use codex_protocol::request_user_input::RequestUserInputResponse;
+use codex_protocol::turn_input::TurnInput;
 use codex_protocol::user_input::UserInput;
 use codex_utils_cargo_bin::cargo_bin;
 use codex_utils_path_uri::PathUri;
@@ -87,6 +108,7 @@ use core_test_support::stdio_server_bin;
 use core_test_support::submit_thread_settings;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::test_env;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::test_docker_container_name;
 use core_test_support::wait_for_event;
@@ -96,6 +118,7 @@ use image::DynamicImage;
 use image::GenericImageView;
 use image::ImageBuffer;
 use image::Rgba;
+use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use serial_test::serial;
@@ -107,6 +130,11 @@ use tokio::process::Command;
 use tokio::time::Instant;
 use tokio::time::sleep;
 use wiremock::MockServer;
+
+#[path = "mcp_oauth_refresh_tests.rs"]
+mod oauth_refresh_tests;
+#[path = "mcp_storage_telemetry_tests.rs"]
+mod storage_telemetry_tests;
 
 static OPENAI_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAD0AAAA9CAYAAAAeYmHpAAAE6klEQVR4Aeyau44UVxCGx1fZsmRLlm3Zoe0XcGQ5cUiCCIgJeS9CHgAhMkISQnIuGQgJEkBcxLW+nqnZ6uqqc+nuWRC7q/P3qetf9e+MtOwyX25O4Nep6JPyop++0qev9HrfgZ+F6r2DuB/vHOrt/UIkqdDHYvujOW6fO7h/CNEI+a5jc+pBR8uy0jVFsziYu5HtfSUk+Io34q921hLNctFSX0gwww+S8wce8K1LfCU+cYW4888aov8NxqvQILUPPReLOrm6zyLxa4i+6VZuFbJo8d1MOHZm+7VUtB/aIvhPWc/3SWg49JcwFLlHxuXKjtyloo+YNhuW3VS+WPBuUEMvCFKjEDVgFBQHXrnazpqiSxNZCkQ1kYiozsbm9Oz7l4i2Il7vGccGNWAc3XosDrZe/9P3ZnMmzHNEQw4smf8RQ87XEAMsC7Az0Au+dgXerfH4+sHvEc0SYGic8WBBUGqFH2gN7yDrazy7m2pbRTeRmU3+MjZmr1h6LJgPbGy23SI6GlYT0brQ71IY8Us4PNQCm+zepSbaD2BY9xCaAsD9IIj/IzFmKMSdHHonwdZATbTnYREf6/VZGER98N9yCWIvXQwXDoDdhZJoT8jwLnJXDB9w4Sb3e6nK5ndzlkTLnP3JBu4LKkbrYrU69gCVceV0JvpyuW1xlsUVngzhwMetn/XamtTORF9IO5YnWNiyeF9zCAfqR3fUW+vZZKLtgP+ts8BmQRBREAdRDhH3o8QuRh/YucNFz2BEjxbRN6LGzphfKmvP6v6QhqIQyZ8XNJ0W0X83MR1PEcJBNO2KC2Z1TW/v244scp9FwRViZxIOBF0Lctk7ZVSavdLvRlV1hz/ysUi9sr8CIcB3nvWBwA93ykTz18eAYxQ6N/K2DkPA1lv3iXCwmDUT7YkjIby9siXueIJj9H+pzSqJ9oIuJWTUgSSt4WO7o/9GGg0viR4VinNRUDoIj34xoCd6pxD3aK3zfdbnx5v1J3ZNNEJsE0sBG7N27ReDrJc4sFxz7dI/ZAbOmmiKvHBitQXpAdR6+F7v+/ol/tOouUV01EeMZQF2BoQDn6dP4XNr+j9GZEtEK1/L8pFw7bd3a53tsTa7WD+054jOFmPg1XBKPQgnqFfmFcy32ZRvjmiIIQTYFvyDxQ8nH8WIwwGwlyDjDznnilYyFr6njrlZwsKkBpO59A7OwgdzPEWRm+G+oeb7IfyNuzjEEVLrOVxJsxvxwF8kmCM6I2QYmJunz4u4TrADpfl7mlbRTWQ7VmrBzh3+C9f6Grc3YoGN9dg/SXFthpRsT6vobfXRs2VBlgBHXVMLHjDNbIZv1sZ9+X3hB09cXdH1JKViyG0+W9bWZDa/r2f9zAFR71sTzGpMSWz2iI4YssWjWo3REy1MDGjdwe5e0dFSiAC1JakBvu4/CUS8Eh6dqHdU0Or0ioY3W5ClSqDXAy7/6SRfgw8vt4I+tbvvNtFT2kVDhY5+IGb1rCqYaXNF08vSALsXCPmt0kQNqJT1p5eI1mkIV/BxCY1z85lOzeFbPBQHURkkPTlwTYK9gTVE25l84IbFFN+YJDHjdpn0gq6mrHht0dkcjbM4UL9283O5p77GN+SPW/QwVB4IUYg7Or+Kp7naR6qktP98LNF2UxWo9yObPIT9KYg+hK4i56no4rfnM0qeyFf6AwAAAP//trwR3wAAAAZJREFUAwBZ0sR75itw5gAAAABJRU5ErkJggg==";
 
@@ -332,9 +360,17 @@ fn stdio_transport_with_cwd(
 fn insert_mcp_server(
     config: &mut Config,
     server_name: &str,
-    transport: McpServerTransportConfig,
+    mut transport: McpServerTransportConfig,
     options: TestMcpServerOptions,
 ) {
+    // Executor stdio has no host-local cwd fallback. Use the fixture's selected
+    // workspace unless this test supplied a more specific server directory.
+    if options.environment_id == REMOTE_MCP_ENVIRONMENT
+        && let McpServerTransportConfig::Stdio { cwd, .. } = &mut transport
+        && cwd.is_none()
+    {
+        *cwd = Some(LegacyAppPathString::from_path(config.cwd.as_path()));
+    }
     let mut servers = config.mcp_servers.get().clone();
     servers.insert(
         server_name.to_string(),
@@ -344,7 +380,9 @@ fn insert_mcp_server(
             environment_id: options.environment_id,
             enabled: true,
             required: false,
+            startup_readiness: Default::default(),
             supports_parallel_tool_calls: options.supports_parallel_tool_calls,
+            tool_input_schema_max_bytes: None,
             omit_tools_from: None,
             disabled_reason: None,
             startup_timeout_sec: Some(Duration::from_secs(10)),
@@ -579,6 +617,118 @@ async fn mcp_namespace_instructions_are_preserved_without_hiding_tools() -> anyh
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_only_mcp_content_uses_content_items() -> anyhow::Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "requires a Windows test_stdio_server in the Wine-exec environment"
+    );
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let call_id = "content-items-1";
+    let server_name = "rmcp";
+    let namespace = format!("mcp__{server_name}");
+    mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_function_call_with_namespace(
+                call_id,
+                &namespace,
+                "image_scenario",
+                r#"{"scenario":"text_only","caption":"content item fixture result"}"#,
+            ),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let final_mock = mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_assistant_message("msg-1", "done"),
+            responses::ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    let command = remote_aware_stdio_server_bin()?;
+    let fixture = test_codex()
+        .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = false)
+        .with_config(move |config| {
+            insert_mcp_server(
+                config,
+                server_name,
+                stdio_transport(command, /*env*/ None, Vec::new()),
+                TestMcpServerOptions {
+                    environment_id: remote_aware_environment_id(),
+                    ..Default::default()
+                },
+            );
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    wait_for_mcp_server(&fixture.codex, server_name).await?;
+
+    fixture
+        .codex
+        .start_or_steer_turn(read_only_user_turn(&fixture, "return content items"))
+        .await?;
+    wait_for_event(&fixture.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let request = final_mock.single_request();
+    let output = request.function_call_output(call_id);
+    let header = output["output"][0]["text"]
+        .as_str()
+        .expect("first content item should contain the wall-time header");
+    assert_wall_time_header(header);
+    assert_eq!(
+        output["output"],
+        json!([
+            {
+                "type": "input_text",
+                "text": header,
+            },
+            {
+                "type": "input_text",
+                "text": "content item fixture result",
+            },
+        ])
+    );
+
+    let request_body = request.body_json();
+    let first_turn_id = request_body["client_metadata"]["turn_id"].clone();
+    assert!(first_turn_id.is_string());
+    let expected_attribution = json!({
+        "status": "complete",
+        "sources": [{
+            "server_name": "rmcp",
+            "tool_name": "image_scenario",
+            "first_turn_id": first_turn_id,
+        }],
+    });
+    assert_eq!(
+        serde_json::to_value(codex_core::test_support::mcp_attribution_snapshot(
+            &fixture.codex
+        ))?,
+        expected_attribution,
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            request_body["client_metadata"]["mcp_attribution"]
+                .as_str()
+                .context("MCP attribution should be included for the OpenAI provider")?,
+        )?,
+        expected_attribution,
+    );
+
+    server.verify().await;
+    Ok(())
+}
+
 #[test_case(false; "configured servers")]
 #[test_case(true; "plugin servers")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -592,7 +742,7 @@ async fn environment_mcp_policy_filters_runtime_config_and_model_tools(
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
-    let response = mount_sse_once(
+    mount_sse_once(
         &server,
         responses::sse(vec![
             responses::ev_response_created("resp-1"),
@@ -604,12 +754,14 @@ async fn environment_mcp_policy_filters_runtime_config_and_model_tools(
     let command = remote_aware_stdio_server_bin()?;
     let allowed_command = command.clone();
     let codex_home = Arc::new(tempdir()?);
+    let test_env = test_env().await?;
     if from_plugin {
         let plugin_root =
             super::plugins::write_sample_plugin_manifest_and_config(codex_home.as_ref());
         let plugin_server = json!({
             "command": command,
             "environment_id": remote_aware_environment_id(),
+            "cwd": test_env.cwd(),
         });
         fs::write(
             plugin_root.join(".mcp.json"),
@@ -648,7 +800,7 @@ async fn environment_mcp_policy_filters_runtime_config_and_model_tools(
                 },
             );
         })
-        .build_with_auto_env(&server)
+        .build_with_environment(&server, test_env)
         .await?;
 
     let selection = fixture
@@ -672,6 +824,9 @@ async fn environment_mcp_policy_filters_runtime_config_and_model_tools(
         },
     )
     .await?;
+    fixture
+        .submit_text_turn("start with pending environment configuration")
+        .await?;
     let (pending_config, _) = fixture.codex.current_mcp_config_and_runtime_context().await;
     let pending_servers = pending_config.mcp_server_catalog.configured_servers();
     assert!(!pending_servers["allowed"].enabled);
@@ -708,10 +863,14 @@ async fn environment_mcp_policy_filters_runtime_config_and_model_tools(
             &selection,
             EnvironmentConfig {
                 allow_login_shell: true,
+                workspace_roots: selection.workspace_roots.clone(),
                 permission_profile: PermissionProfileSnapshot::legacy(
                     fixture.config.permissions.permission_profile().clone(),
                 ),
                 shell_environment_policy: Default::default(),
+                windows_sandbox_level: WindowsSandboxLevel::from_config(&fixture.config),
+                windows_sandbox_type: fixture.config.permissions.windows_sandbox_type,
+                use_legacy_landlock: fixture.config.features.use_legacy_landlock(),
                 exec_policy: None,
                 mcp_policy: Some(mcp_policy),
                 network_policy: None,
@@ -734,6 +893,15 @@ async fn environment_mcp_policy_filters_runtime_config_and_model_tools(
         )
         .await?;
 
+    let response = mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("resp-2"),
+            responses::ev_assistant_message("msg-2", "done"),
+            responses::ev_completed("resp-2"),
+        ]),
+    )
+    .await;
     fixture
         .submit_text_turn("show the available MCP tools")
         .await?;
@@ -751,9 +919,155 @@ async fn environment_mcp_policy_filters_runtime_config_and_model_tools(
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn future_environment_mcp_policy_applies_on_the_next_turn() -> anyhow::Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "requires a Windows test_stdio_server in the Wine-exec environment"
+    );
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let response = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse(vec![
+                responses::ev_function_call(
+                    "pause",
+                    "request_user_input",
+                    &json!({
+                        "questions": [{
+                            "id": "continue",
+                            "header": "Continue",
+                            "question": "Continue?",
+                            "options": [
+                                {"label": "Yes (Recommended)", "description": "Continue."},
+                                {"label": "No", "description": "Stop."}
+                            ]
+                        }]
+                    })
+                    .to_string(),
+                ),
+                responses::ev_completed("paused"),
+            ]),
+            responses::sse(vec![responses::ev_completed("active-done")]),
+            responses::sse(vec![responses::ev_completed("next-done")]),
+        ],
+    )
+    .await;
+    let command = remote_aware_stdio_server_bin()?;
+    let allowed_command = command.clone();
+    let fixture = test_codex()
+        .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = false)
+        .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::DefaultModeRequestUserInput)
+                .unwrap();
+            insert_mcp_server(
+                config,
+                "environment_policy",
+                stdio_transport(command, /*env*/ None, Vec::new()),
+                TestMcpServerOptions {
+                    environment_id: remote_aware_environment_id(),
+                    ..Default::default()
+                },
+            );
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    wait_for_mcp_server(&fixture.codex, "environment_policy").await?;
+    let selection = fixture.codex.environment_selections().await.remove(0);
+    let mut config = EnvironmentConfig {
+        allow_login_shell: fixture.config.permissions.allow_login_shell,
+        workspace_roots: selection.workspace_roots.clone(),
+        permission_profile: PermissionProfileSnapshot::legacy(
+            fixture.config.permissions.permission_profile().clone(),
+        ),
+        shell_environment_policy: Default::default(),
+        windows_sandbox_level: WindowsSandboxLevel::from_config(&fixture.config),
+        windows_sandbox_type: fixture.config.permissions.windows_sandbox_type,
+        use_legacy_landlock: fixture.config.features.use_legacy_landlock(),
+        exec_policy: None,
+        mcp_policy: Some(EnvironmentMcpPolicy {
+            servers: Some(BTreeMap::from([(
+                "environment_policy".to_string(),
+                McpServerRequirement::Identity {
+                    identity: McpServerIdentity::Command {
+                        command: allowed_command,
+                    },
+                },
+            )])),
+            plugins: None,
+        }),
+        network_policy: None,
+        selected_capability_roots: Vec::new(),
+    };
+    let settings = |config| ThreadSettingsOverrides {
+        environments: Some(TurnEnvironmentSelections::new(
+            fixture.config.cwd.clone(),
+            vec![TurnEnvironmentSelection {
+                config: EnvironmentConfigState::Ready(config),
+                ..selection.clone()
+            }],
+        )),
+        ..Default::default()
+    };
+    submit_thread_settings(&fixture.codex, settings(config.clone())).await?;
+    fixture
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "pause before continuing".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let EventMsg::RequestUserInput(request) = wait_for_event(&fixture.codex, |event| {
+        matches!(event, EventMsg::RequestUserInput(_))
+    })
+    .await
+    else {
+        unreachable!("wait_for_event should return the request-user-input event")
+    };
+
+    config.mcp_policy.as_mut().unwrap().servers = Some(BTreeMap::new());
+    submit_thread_settings(&fixture.codex, settings(config)).await?;
+    fixture
+        .codex
+        .submit(Op::UserInputAnswer {
+            id: request.turn_id,
+            response: RequestUserInputResponse {
+                answers: HashMap::from([(
+                    "continue".to_string(),
+                    RequestUserInputAnswer {
+                        answers: vec!["Yes (Recommended)".to_string()],
+                    },
+                )]),
+            },
+        })
+        .await?;
+    wait_for_event(&fixture.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    fixture.submit_text_turn("start the next turn").await?;
+
+    let tool_is_visible = response
+        .requests()
+        .iter()
+        .map(|request| {
+            responses::namespace_child_tool(&request.body_json(), "mcp__environment_policy", "echo")
+                .is_some()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tool_is_visible, vec![true, true, false]);
+    Ok(())
+}
+
+#[test_case("rmcp", "mcp__rmcp"; "simple name")]
+#[test_case("npm:@scope/package.name", "mcp__npm__scope_package_name"; "npm name")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial(mcp_test_value)]
-async fn stdio_server_round_trip() -> anyhow::Result<()> {
+async fn stdio_server_round_trip(server_name: &'static str, namespace: &str) -> anyhow::Result<()> {
     // TODO(anp): Remove after packaging a Windows stdio test server for Wine exec.
     skip_if_wine_exec!(
         Ok(()),
@@ -765,8 +1079,7 @@ async fn stdio_server_round_trip() -> anyhow::Result<()> {
 
     let call_id = "call-123";
     let search_call_id = "search-rmcp-echo";
-    let server_name = "rmcp";
-    let namespace = format!("mcp__{server_name}");
+    let namespace = namespace.to_string();
 
     let search_mock = mount_sse_once(
         &server,
@@ -900,7 +1213,7 @@ async fn stdio_server_round_trip() -> anyhow::Result<()> {
         search_description.len() < 513 * 1024,
         "the complete tool search description must remain bounded"
     );
-    assert!(search_description.contains(&format!("- rmcp: {expected_description}")));
+    assert!(search_description.contains(&format!("- {server_name}: {expected_description}")));
     assert!(search_description.contains("🦀keep the complete MCP metadata"));
 
     let search_output = call_mock
@@ -1055,9 +1368,12 @@ server_names = ["history", "notes"]
     Ok(())
 }
 
+#[test_case(McpProtocolMode::Legacy; "legacy")]
+#[test_case(McpProtocolMode::V20260728; "modern")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn modern_mcp_pagination_preserves_valid_tools_and_rejects_oversized_cursors()
--> anyhow::Result<()> {
+async fn mcp_pagination_preserves_valid_tools_and_rejects_oversized_cursors(
+    protocol_mode: McpProtocolMode,
+) -> anyhow::Result<()> {
     skip_if_wine_exec!(
         Ok(()),
         "requires a Windows test_stdio_server in the Wine-exec environment"
@@ -1065,43 +1381,45 @@ async fn modern_mcp_pagination_preserves_valid_tools_and_rejects_oversized_curso
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
+    let call_id = "call-second-page-tool";
     let response = mount_sse_once(
         &server,
         responses::sse(vec![
             responses::ev_response_created("resp-1"),
-            responses::ev_assistant_message("msg-1", "done"),
+            responses::ev_function_call_with_namespace(call_id, "mcp__paginated", "sync", "{}"),
             responses::ev_completed("resp-1"),
         ]),
     )
     .await;
+    let final_mock = mount_sse_once(&server, responses::sse_completed("resp-2")).await;
     let command = remote_aware_stdio_server_bin()?;
     let fixture = test_codex()
         .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = false)
         .with_config(move |config| {
             config
                 .features
-                .enable(Feature::Mcp20260728)
-                .expect("test config should allow modern MCP");
+                .set_enabled(
+                    Feature::Mcp20260728,
+                    protocol_mode == McpProtocolMode::V20260728,
+                )
+                .expect("test config should allow MCP protocol selection");
             for (server_name, pagination) in
                 [("paginated", "two-pages"), ("rejected", "oversized-cursor")]
             {
+                let mut env = HashMap::from([(
+                    "MCP_TEST_TOOL_PAGINATION".to_string(),
+                    pagination.to_string(),
+                )]);
+                if protocol_mode == McpProtocolMode::V20260728 {
+                    env.insert(
+                        "CODEX_MCP_PROTOCOL_VERSION".to_string(),
+                        "2026-07-28".to_string(),
+                    );
+                }
                 insert_mcp_server(
                     config,
                     server_name,
-                    stdio_transport(
-                        command.clone(),
-                        Some(HashMap::from([
-                            (
-                                "CODEX_MCP_PROTOCOL_VERSION".to_string(),
-                                "2026-07-28".to_string(),
-                            ),
-                            (
-                                "MCP_TEST_TOOL_PAGINATION".to_string(),
-                                pagination.to_string(),
-                            ),
-                        ])),
-                        Vec::new(),
-                    ),
+                    stdio_transport(command.clone(), Some(env), Vec::new()),
                     TestMcpServerOptions {
                         environment_id: remote_aware_environment_id(),
                         ..Default::default()
@@ -1134,9 +1452,9 @@ async fn modern_mcp_pagination_preserves_valid_tools_and_rejects_oversized_curso
 
     fixture
         .codex
-        .start_or_steer_turn(read_only_user_turn(
+        .start_or_steer_turn(auto_approved_user_turn(
             &fixture,
-            "show the paginated MCP tools",
+            "call the paginated sync tool",
         ))
         .await?;
     wait_for_event(&fixture.codex, |event| {
@@ -1155,6 +1473,12 @@ async fn modern_mcp_pagination_preserves_valid_tools_and_rejects_oversized_curso
         responses::namespace_child_tool(&body, "mcp__rejected", "echo").is_none(),
         "a rejected MCP catalog must not reach the model"
     );
+    let output = final_mock.single_request().function_call_output(call_id);
+    let output_text = output["output"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected successful MCP tool output, got {output}"));
+    let output_json: Value = serde_json::from_str(split_wall_time_wrapped_output(output_text))?;
+    assert_eq!(output_json, json!({"result": "ok"}));
     Ok(())
 }
 
@@ -1268,6 +1592,18 @@ async fn shutdown_cancels_startup_prewarm_waiting_for_mcp_startup() -> anyhow::R
                 },
                 TestMcpServerOptions::default(),
             );
+            // Wait for discovery instead of skipping the pending optional server.
+            // Its startup timeout exceeds every bounded wait in this test.
+            config.mcp_optional_startup_grace = Duration::ZERO;
+            let mut servers = config.mcp_servers.get().clone();
+            let pending = servers
+                .get_mut("shutdown_prewarm")
+                .expect("pending MCP server");
+            pending.startup_timeout_sec = Some(Duration::from_secs(300));
+            config
+                .mcp_servers
+                .set(servers)
+                .expect("valid MCP configuration");
         })
         .build_with_websocket_server(&server)
         .await?;
@@ -1276,15 +1612,212 @@ async fn shutdown_cancels_startup_prewarm_waiting_for_mcp_startup() -> anyhow::R
         tokio::time::timeout(Duration::from_secs(5), pending_mcp_listener.accept())
             .await
             .context("startup prewarm should start the MCP connection")??;
+    assert!(
+        server
+            .wait_for_connections(/*expected*/ 1, Duration::from_secs(2))
+            .await,
+        "websocket handshake should overlap pending MCP tool startup"
+    );
+    assert!(
+        server.single_connection().is_empty(),
+        "prewarm should wait for tools before sending generate=false"
+    );
     tokio::time::timeout(Duration::from_secs(2), fixture.codex.shutdown_and_wait())
         .await
         .context("shutdown should not wait for startup prewarm MCP startup")??;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Dropping the thread closes its cached socket. Wait for the server to drain preceding frames.
+    drop(fixture);
     assert!(
-        server.connections().is_empty(),
-        "startup prewarm should not send a websocket request after shutdown"
+        server
+            .wait_for_closed_connections(/*expected*/ 1, Duration::from_secs(3))
+            .await,
+        "websocket server should drain pending frames after startup cancellation"
+    );
+    assert_eq!(
+        server.single_connection().len(),
+        0,
+        "blocked MCP discovery must prevent any startup prewarm request"
     );
 
+    server.shutdown().await;
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PrewarmMcpScenario {
+    Responses,
+    ResponsesLite,
+    EagerSocketCloses,
+}
+
+#[test_case(PrewarmMcpScenario::Responses; "responses")]
+#[test_case(PrewarmMcpScenario::ResponsesLite; "responses lite")]
+#[test_case(PrewarmMcpScenario::EagerSocketCloses; "prewarm reconnects when the eager socket closes")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_prewarm_connects_before_delayed_mcp_tools_then_reuses_socket(
+    scenario: PrewarmMcpScenario,
+) -> anyhow::Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "requires a Windows test_stdio_server in the Wine-exec environment"
+    );
+    skip_if_no_network!(Ok(()));
+    let use_responses_lite = scenario == PrewarmMcpScenario::ResponsesLite;
+    let close_eager_socket = scenario == PrewarmMcpScenario::EagerSocketCloses;
+
+    let warmup_events = vec![
+        responses::ev_response_created("warm-1"),
+        responses::ev_completed("warm-1"),
+    ];
+    let turn_events = vec![
+        responses::ev_response_created("turn-1"),
+        responses::ev_assistant_message("message-1", "done"),
+        responses::ev_completed("turn-1"),
+    ];
+    let requests = vec![warmup_events, turn_events];
+    let connections = if close_eager_socket {
+        // A connection without scripted requests closes as soon as it is accepted.
+        vec![Vec::new(), requests]
+    } else {
+        vec![requests]
+    };
+    let server = responses::start_websocket_server(connections).await;
+    let command = stdio_server_bin()?;
+    let service_tier = ServiceTier::Fast.request_value();
+    let fixture = test_codex()
+        .with_model("gpt-5.4")
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_model_info_override("gpt-5.4", move |model| {
+            model.supports_search_tool = false;
+            model.use_responses_lite = use_responses_lite;
+            if use_responses_lite {
+                model.tool_mode = Some(ToolMode::CodeMode);
+            }
+            model.service_tiers.push(ModelServiceTier {
+                id: service_tier.to_string(),
+                name: "Fast".to_string(),
+                description: "Priority processing".to_string(),
+            });
+        })
+        .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::FastMode)
+                .expect("enable Fast Mode for routing hint");
+            config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+            config.tool_registry.turn_metadata_includes_tool_info = use_responses_lite;
+            config.mcp_optional_startup_grace = Duration::ZERO;
+            let barrier_file = config.cwd.join("allow-prewarm-mcp-initialize");
+            insert_mcp_server(
+                config,
+                "delayed_prewarm",
+                stdio_transport(
+                    command,
+                    Some(HashMap::from([(
+                        "MCP_TEST_INITIALIZE_BARRIER_FILE".to_string(),
+                        barrier_file.to_string_lossy().to_string(),
+                    )])),
+                    Vec::new(),
+                ),
+                TestMcpServerOptions::default(),
+            );
+        })
+        .build_with_websocket_server(&server)
+        .await?;
+
+    assert!(
+        server
+            .wait_for_connections(/*expected*/ 1, Duration::from_secs(5))
+            .await,
+        "websocket handshake should finish while MCP discovery is blocked"
+    );
+    assert_eq!(
+        server
+            .single_handshake()
+            .header(X_CODEX_ROUTING_HINT_HEADER),
+        Some(format!("model=gpt-5.4;tier={service_tier}"))
+    );
+    assert!(
+        server.single_connection().is_empty(),
+        "prewarm should wait for delayed MCP discovery"
+    );
+    if close_eager_socket {
+        assert!(
+            server
+                .wait_for_closed_connections(/*expected*/ 1, Duration::from_secs(5))
+                .await,
+            "the eager socket must close before MCP discovery is released"
+        );
+    }
+    std::fs::write(
+        fixture.workspace_path("allow-prewarm-mcp-initialize"),
+        b"ready",
+    )?;
+    wait_for_mcp_server(&fixture.codex, "delayed_prewarm").await?;
+
+    let namespace = "mcp__delayed_prewarm";
+    let connection_index = usize::from(close_eager_socket);
+    let prewarm = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                request = server.wait_for_request(connection_index, /*request_index*/ 0) => break request,
+                // The reader may observe the close after the initial warmup tries to send.
+                _ = tokio::time::sleep(Duration::from_millis(10)), if close_eager_socket => {
+                    fixture.codex.prewarm().await;
+                }
+            }
+        }
+    })
+    .await
+    .context("prewarm should send its request after MCP discovery")?
+    .body_json();
+    assert_eq!(prewarm["type"].as_str(), Some("response.create"));
+    assert_eq!(prewarm["generate"].as_bool(), Some(false));
+    assert!(prewarm.get("previous_response_id").is_none());
+    assert_eq!(prewarm["service_tier"].as_str(), Some(service_tier));
+    let tool_body = if use_responses_lite {
+        &prewarm["input"][0]
+    } else {
+        &prewarm
+    };
+    assert!(
+        responses::namespace_child_tool(tool_body, namespace, "echo").is_some(),
+        "prewarm should contain the discovered MCP echo tool: {prewarm:?}"
+    );
+    let metadata: Value = serde_json::from_str(
+        prewarm["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .context("prewarm should include turn metadata")?,
+    )?;
+    if use_responses_lite {
+        assert!(
+            metadata["tool_namespaces_info"][namespace]["functions"]["echo"].is_object(),
+            "Responses Lite prewarm metadata should reflect discovered MCP tools: {metadata:?}"
+        );
+    }
+
+    fixture.submit_text_turn("hello").await?;
+    let first_turn = tokio::time::timeout(
+        Duration::from_secs(5),
+        server.wait_for_request(connection_index, /*request_index*/ 1),
+    )
+    .await
+    .context("first turn should reuse the prewarmed socket")?
+    .body_json();
+    assert_eq!(first_turn["type"], "response.create");
+    assert!(first_turn.get("generate").is_none());
+    assert_eq!(first_turn["previous_response_id"], "warm-1");
+    let handshakes = server.handshakes();
+    assert_eq!(handshakes.len(), connection_index + 1);
+    if close_eager_socket {
+        assert!(server.connections()[0].is_empty());
+        assert_eq!(
+            handshakes[1].header(X_CODEX_ROUTING_HINT_HEADER),
+            handshakes[0].header(X_CODEX_ROUTING_HINT_HEADER)
+        );
+    }
+
+    fixture.codex.shutdown_and_wait().await?;
     server.shutdown().await;
     Ok(())
 }
@@ -1310,7 +1843,28 @@ async fn interrupt_during_mcp_startup_preserves_user_input_in_history(
     let pending_mcp_url = format!("http://{}/mcp", pending_mcp_listener.local_addr()?);
 
     let fixture = test_codex()
+        .with_model_info_override("gpt-5.4", |model| {
+            model.use_responses_lite = false;
+            model.supports_image_detail_original = false;
+        })
         .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::StepModelSwitching)
+                .expect("enable step model switching");
+            config
+                .features
+                .enable(Feature::UnifiedImageBudget)
+                .expect("enable unified image budget");
+            let models = &mut config.model_catalog.as_mut().expect("model catalog").models;
+            let mut current_model = models
+                .iter()
+                .find(|model| model.slug == "gpt-5.4")
+                .expect("initial model")
+                .clone();
+            current_model.slug = "startup-image-model".to_string();
+            current_model.supports_image_detail_original = true;
+            models.push(current_model);
             config.model_provider.supports_websockets =
                 matches!(startup_phase, InterruptedMcpStartupPhase::StartupPrewarm);
             if matches!(
@@ -1340,14 +1894,38 @@ async fn interrupt_during_mcp_startup_preserves_user_input_in_history(
             .await
             .context("MCP startup should connect before the turn is interrupted")??;
     let prompt = "keep this interrupted prompt in conversation history";
-    fixture
-        .codex
-        .start_or_steer_turn(read_only_user_turn(&fixture, prompt))
-        .await?;
-    wait_for_event(&fixture.codex, |event| {
-        matches!(event, EventMsg::TurnStarted(_))
+    let mut input = read_only_user_turn(&fixture, prompt);
+    let TurnInput::UserInput { content, .. } = &mut input.input else {
+        unreachable!("read_only_user_turn creates user input");
+    };
+    content.push(UserInput::Image {
+        image: ImageReference::Inline {
+            image_url: OPENAI_PNG.to_string(),
+        },
+        detail: Some(ImageDetail::High),
+    });
+    fixture.codex.start_or_steer_turn(input).await?;
+    let turn_id = core_test_support::wait_for_event_match(&fixture.codex, |event| match event {
+        EventMsg::TurnStarted(started) => Some(started.turn_id.clone()),
+        _ => None,
     })
     .await;
+    let (reply, outcome) = tokio::sync::oneshot::channel();
+    fixture
+        .codex
+        .submit(Op::TurnSettings {
+            turn_id,
+            update: TurnSettingsUpdate {
+                model: Some("startup-image-model".to_string()),
+                ..Default::default()
+            },
+            reply,
+        })
+        .await?;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(/*secs*/ 10), outcome).await??,
+        TurnSettingsUpdateOutcome::Applied
+    );
 
     fixture.codex.submit(Op::Interrupt).await?;
     wait_for_event(&fixture.codex, |event| {
@@ -1377,6 +1955,21 @@ async fn interrupt_during_mcp_startup_preserves_user_input_in_history(
             )
         })
         .expect("an interrupted turn should retain its submitted user prompt");
+    let RolloutItem::ResponseItem(envelope) = &history.items[user_prompt_index] else {
+        unreachable!("found the user prompt");
+    };
+    let ResponseItem::Message { content, .. } = &envelope.item else {
+        unreachable!("found the user message");
+    };
+    assert!(
+        content.contains(&ContentItem::InputImage {
+            image: ImageReference::Inline {
+                image_url: OPENAI_PNG.to_string()
+            },
+            detail: Some(ImageDetail::Original),
+        }),
+        "interrupted input must use the current model's unified image budget"
+    );
     let interruption_marker_index = history
         .items
         .iter()
@@ -1500,7 +2093,8 @@ async fn local_stdio_server_uses_runtime_fallback_cwd_when_config_omits_cwd() ->
                 .parent()
                 .expect("relative test server path should include a parent");
             fs::create_dir_all(target_dir).expect("create relative MCP bin directory");
-            fs::copy(&rmcp_test_server_bin, &target_bin).expect("copy test stdio server");
+            codex_utils_cargo_bin::copy_executable(&rmcp_test_server_bin, &target_bin)
+                .expect("copy test stdio server");
 
             insert_mcp_server(
                 config,
@@ -1533,14 +2127,31 @@ async fn local_stdio_server_uses_runtime_fallback_cwd_when_config_omits_cwd() ->
     Ok(())
 }
 
-#[test_case(false, false; "both disabled")]
-#[test_case(true, false; "auto review required")]
-#[test_case(false, true; "disabled")]
-#[test_case(true, true; "both enabled")]
+#[test_case("rmcp", false, false, false, Some("catalog policy"), Some("native catalog policy"), false; "both disabled")]
+#[test_case("rmcp", true, false, false, Some("catalog policy"), Some("native catalog policy"), false; "auto review required")]
+#[test_case("rmcp", false, true, false, Some("catalog policy"), Some("native catalog policy"), false; "disabled")]
+#[test_case("rmcp", true, true, false, Some("catalog policy"), Some("native catalog policy"), false; "both enabled")]
+#[test_case("rmcp", false, false, true, Some("catalog policy"), Some("native catalog policy"), false; "attachment-owned permissions preserve foreign workspace roots")]
+#[test_case("node_repl", false, false, false, Some("  # Policy A\r\n{literal} <raw> & café\n"), Some("\t# Native A\n{{literal}} & desktop\r\n"), false; "node repl raw policy")]
+#[test_case("cua_repl", false, false, false, Some("\t# Policy B\n${literal} </policy>\r\n "), Some("  # Native B\r\n<computer> ${native}\n "), false; "cua repl raw policy")]
+#[test_case("node_repl", false, false, false, None, None, false; "node repl missing policy")]
+#[test_case("cua_repl", false, false, false, Some(""), Some("native retained"), false; "cua repl empty policy")]
+#[test_case("node_repl", false, false, false, Some(" \r\n\t"), Some("native retained"), false; "node repl blank policy")]
+#[test_case("node_repl", false, false, false, None, Some("native retained"), false; "node repl missing browser policy")]
+#[test_case("cua_repl", false, false, false, Some("browser retained"), None, false; "cua repl missing computer policy")]
+#[test_case("node_repl", false, false, false, Some("browser retained"), Some(""), false; "node repl empty computer policy")]
+#[test_case("cua_repl", false, false, false, Some("browser retained"), Some(" \r\n\t"), false; "cua repl blank computer policy")]
+#[test_case("cua_repl", false, false, false, None, None, true; "mxc backend handoff")]
+#[test_case("cua_repl", false, false, true, None, None, true; "mxc preference does not leak to attachment")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
+    server_name: &'static str,
     node_repl_auto_review_required: bool,
     node_repl_disabled: bool,
+    attachment_owned_permissions: bool,
+    browser_policy: Option<&str>,
+    computer_policy: Option<&str>,
+    prefer_mxc: bool,
 ) -> anyhow::Result<()> {
     // TODO(anp): Remove after packaging a Windows stdio test server for Wine exec.
     skip_if_wine_exec!(
@@ -1552,27 +2163,54 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
     let server = responses::start_mock_server().await;
 
     let call_id = "sandbox-meta-call";
-    let server_name = "rmcp";
+    let restricted_call_id = "owner-restricted-call";
     let namespace = format!("mcp__{server_name}");
     let mut models = codex_models_manager::bundled_models_response()?;
     let model = models
         .models
         .iter_mut()
-        .find(|model| model.slug == "gpt-5.4")
+        .find(|model| model.slug == "gpt-5.5")
         .expect("bundled model should exist");
     model.node_repl_auto_review_required = node_repl_auto_review_required;
     model.node_repl_disabled = node_repl_disabled;
+    let messages = model
+        .model_messages
+        .as_mut()
+        .expect("bundled model messages");
+    messages.confirmation_policies = Some(ConfirmationPolicies {
+        browser_use: browser_policy.map(str::to_owned),
+        computer_use: computer_policy.map(str::to_owned),
+    });
     let models_mock = mount_models_once(&server, models).await;
 
-    let initial_mock = mount_sse_once(
-        &server,
-        responses::sse(vec![
-            responses::ev_response_created("resp-1"),
-            responses::ev_function_call_with_namespace(call_id, &namespace, "sandbox_meta", "{}"),
-            responses::ev_completed("resp-1"),
-        ]),
-    )
-    .await;
+    let mut response_events = vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_function_call_with_namespace(
+            call_id,
+            &namespace,
+            "sandbox_meta",
+            &json!({
+                "_meta": {
+                    "openai/confirmation_policies": {
+                        "browser_use": "forged argument policy",
+                        "computer_use": "forged computer policy",
+                    },
+                    "threadId": "forged-thread",
+                },
+            })
+            .to_string(),
+        ),
+    ];
+    if attachment_owned_permissions {
+        response_events.push(responses::ev_function_call_with_namespace(
+            restricted_call_id,
+            &namespace,
+            "sync",
+            "{}",
+        ));
+    }
+    response_events.push(responses::ev_completed("resp-1"));
+    let initial_mock = mount_sse_once(&server, responses::sse(response_events)).await;
     let final_mock = mount_sse_once(
         &server,
         responses::sse(vec![
@@ -1585,8 +2223,9 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
     let rmcp_test_server_bin = remote_aware_stdio_server_bin()?;
     let fixture = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_model("gpt-5.4")
+        .with_model("gpt-5.5")
         .with_config(move |config| {
+            config.prefer_mxc = prefer_mxc;
             insert_mcp_server(
                 config,
                 server_name,
@@ -1601,6 +2240,85 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
         .await?;
 
     wait_for_mcp_server(&fixture.codex, server_name).await?;
+    let owner_permission_profile = if attachment_owned_permissions {
+        PermissionProfile::from_runtime_permissions(
+            &FileSystemSandboxPolicy::restricted(vec![
+                FileSystemSandboxEntry::new(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::Root,
+                    },
+                    FileSystemAccessMode::Write,
+                ),
+                FileSystemSandboxEntry::new(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                    },
+                    FileSystemAccessMode::Read,
+                ),
+                FileSystemSandboxEntry::new(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(Some(".git".to_string())),
+                    },
+                    FileSystemAccessMode::Read,
+                ),
+            ]),
+            NetworkSandboxPolicy::Restricted,
+        )
+    } else {
+        PermissionProfile::read_only()
+    };
+    let owner_workspace_roots = if attachment_owned_permissions {
+        let selection = fixture
+            .codex
+            .environment_selections()
+            .await
+            .into_iter()
+            .find(|selection| selection.environment_id == remote_aware_environment_id())
+            .context("thread should select the MCP server's executor environment")?;
+        let workspace_roots = vec![PathUri::parse(if cfg!(windows) {
+            "file:///foreign/workspace"
+        } else {
+            "file:///C:/workspace"
+        })?];
+        submit_thread_settings(
+            &fixture.codex,
+            ThreadSettingsOverrides {
+                environments: Some(TurnEnvironmentSelections::new(
+                    fixture.config.cwd.clone(),
+                    vec![TurnEnvironmentSelection {
+                        config: EnvironmentConfigState::Pending,
+                        ..selection.clone()
+                    }],
+                )),
+                ..Default::default()
+            },
+        )
+        .await?;
+        fixture
+            .codex
+            .environment_ready(
+                &selection,
+                EnvironmentConfig {
+                    allow_login_shell: fixture.config.permissions.allow_login_shell,
+                    workspace_roots: workspace_roots.clone(),
+                    permission_profile: PermissionProfileSnapshot::legacy(
+                        owner_permission_profile.clone(),
+                    ),
+                    shell_environment_policy: Default::default(),
+                    windows_sandbox_level: WindowsSandboxLevel::from_config(&fixture.config),
+                    windows_sandbox_type: fixture.config.permissions.windows_sandbox_type,
+                    use_legacy_landlock: fixture.config.features.use_legacy_landlock(),
+                    exec_policy: None,
+                    mcp_policy: None,
+                    network_policy: None,
+                    selected_capability_roots: Vec::new(),
+                },
+            )
+            .await?;
+        workspace_roots
+    } else {
+        Vec::new()
+    };
     fixture
         .thread_manager
         .get_models_manager()
@@ -1614,7 +2332,11 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
     fixture
         .submit_turn_with_permission_profile(
             "call the rmcp sandbox_meta tool",
-            PermissionProfile::read_only(),
+            if attachment_owned_permissions {
+                PermissionProfile::Disabled
+            } else {
+                PermissionProfile::read_only()
+            },
         )
         .await?;
 
@@ -1633,7 +2355,20 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
         json!(node_repl_disabled)
     );
 
-    let output_item = final_mock.single_request().function_call_output(call_id);
+    let final_request = final_mock.single_request();
+    if attachment_owned_permissions {
+        let restricted_output_item = final_request.function_call_output(restricted_call_id);
+        let restricted_output = restricted_output_item["output"][1]["text"]
+            .as_str()
+            .expect("restricted MCP tool should produce a denied call output");
+        assert!(
+            restricted_output
+                .contains("MCP tool call requires approval, but approval policy is never"),
+            "attachment-owned permissions should deny the mutable MCP tool: {restricted_output}"
+        );
+    }
+
+    let output_item = final_request.function_call_output(call_id);
     let output_text = output_item
         .get("output")
         .and_then(Value::as_str)
@@ -1652,18 +2387,55 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta(
         output_json.pointer("/x-codex-turn-metadata/node_repl_disabled"),
         Some(&json!(node_repl_disabled))
     );
+    let expected_policies = match server_name {
+        "node_repl" | "cua_repl" => Some(match (browser_policy, computer_policy) {
+            (Some(browser), Some(computer)) => {
+                json!({"browser_use": browser, "computer_use": computer})
+            }
+            (Some(browser), None) => json!({"browser_use": browser}),
+            (None, Some(computer)) => json!({"computer_use": computer}),
+            (None, None) => json!({}),
+        }),
+        _ => None,
+    };
+    assert_eq!(
+        meta.get("openai/confirmation_policies"),
+        expected_policies.as_ref(),
+    );
+    assert_eq!(
+        output_json["threadId"],
+        json!(fixture.session_configured.thread_id.to_string()),
+    );
+    assert_eq!(output_json["callId"], json!(call_id));
 
     let sandbox_meta = meta
         .get(MCP_SANDBOX_STATE_META_CAPABILITY)
         .expect("sandbox state metadata should be present");
     let sandbox_state: SandboxState = serde_json::from_value(sandbox_meta.clone())?;
+    if attachment_owned_permissions {
+        let workspace_root = &owner_workspace_roots[0];
+        for path in [workspace_root.clone(), workspace_root.join(".git")?] {
+            let expected_entry =
+                FileSystemSandboxEntry::new(path.into(), FileSystemAccessMode::Read);
+            assert!(
+                sandbox_state
+                    .permission_profile
+                    .file_system_sandbox_policy()
+                    .entries
+                    .contains(&expected_entry),
+                "foreign workspace root should retain its owner restriction: {expected_entry:?}"
+            );
+        }
+    }
     assert_eq!(
         sandbox_state,
         SandboxState {
-            permission_profile: PermissionProfile::read_only(),
+            permission_profile: owner_permission_profile
+                .materialize_project_roots_with_path_uris(&owner_workspace_roots),
             codex_linux_sandbox_exe: fixture.config.codex_linux_sandbox_exe.clone(),
             sandbox_cwd: PathUri::from_abs_path(&fixture.config.cwd),
             use_legacy_landlock: false,
+            use_mxc: prefer_mxc && cfg!(windows) && !attachment_owned_permissions,
         }
     );
 
@@ -2145,6 +2917,12 @@ async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
         .start_or_steer_turn(read_only_user_turn(&fixture, "call the rmcp image tool"))
         .await?;
 
+    let turn_id = core_test_support::wait_for_event_match(&fixture.codex, |event| match event {
+        EventMsg::TurnStarted(started) => Some(started.turn_id.clone()),
+        _ => None,
+    })
+    .await;
+
     // Wait for tool begin/end and final completion.
     let begin_event = wait_for_event(&fixture.codex, |ev| {
         matches!(ev, EventMsg::McpToolCallBegin(_))
@@ -2156,6 +2934,7 @@ async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
     assert_eq!(
         begin,
         McpToolCallBeginEvent {
+            turn_id: turn_id.clone(),
             call_id: call_id.to_string(),
             invocation: McpInvocation {
                 server: server_name.to_string(),
@@ -2164,6 +2943,7 @@ async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
             },
             connector_id: None,
             mcp_app_resource_uri: None,
+            mcp_app_ui: None,
             link_id: None,
             app_name: None,
             action_name: None,
@@ -2179,6 +2959,7 @@ async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
     let EventMsg::McpToolCallEnd(end) = end_event else {
         unreachable!("end");
     };
+    assert_eq!(end.turn_id, turn_id);
     assert_eq!(end.call_id, call_id);
     assert_eq!(
         end.invocation,
@@ -2369,7 +3150,7 @@ async fn stdio_image_responses_preserve_original_detail_metadata() -> anyhow::Re
     let rmcp_test_server_bin = remote_aware_stdio_server_bin()?;
 
     let fixture = test_codex()
-        .with_model("gpt-5.4")
+        .with_model("gpt-5.5")
         .with_config(move |config| {
             insert_mcp_server(
                 config,
@@ -2454,6 +3235,7 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
                 additional_speed_tiers: Vec::new(),
                 service_tiers: Vec::new(),
                 default_service_tier: None,
+                available_access_programs: None,
                 upgrade: None,
                 model_messages: None,
                 include_skills_usage_instructions: false,
@@ -2477,13 +3259,17 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
                 input_modalities: vec![InputModality::Text],
                 used_fallback_model_metadata: false,
                 supports_search_tool: false,
+                supports_experimental_context: false,
                 use_responses_lite: false,
+                supports_reasoning_effort_updates: false,
+                guardian: None,
                 node_repl_auto_review_required: false,
                 node_repl_disabled: false,
                 auto_review_model_override: None,
                 model_specialty: None,
                 tool_mode: None,
                 multi_agent_version: None,
+                multi_agent_reasoning_effort: None,
             }],
         },
     )
@@ -2565,19 +3351,19 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
     wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let output_item = final_mock.single_request().function_call_output(call_id);
-    let output_text = output_item
-        .get("output")
-        .and_then(Value::as_str)
-        .expect("function_call_output output should be a JSON string");
-    let wrapped_payload = split_wall_time_wrapped_output(output_text);
-    let output_json: Value = serde_json::from_str(wrapped_payload)
-        .expect("function_call_output output should be valid JSON");
+    let header = output_item["output"][0]["text"]
+        .as_str()
+        .expect("first content item should contain the wall-time header");
+    assert_wall_time_header(header);
     assert_eq!(
-        output_json,
-        json!([{
-            "type": "text",
-            "text": "<image content omitted because you do not support image input>"
-        }])
+        output_item["output"],
+        json!([
+            {"type": "input_text", "text": header},
+            {
+                "type": "input_text",
+                "text": "<image content omitted because you do not support image input>",
+            },
+        ])
     );
     server.verify().await;
     Ok(())
@@ -2975,13 +3761,28 @@ impl StreamableHttpTestServer {
     }
 }
 
+enum HeadersHelperMode {
+    None,
+    Static,
+    Rotating,
+    RotatingAuthorization,
+}
+
 /// What this tests: Codex can discover and call a Streamable HTTP MCP tool in
 /// both local and remote-aware placements, and the tool observes the expected
 /// environment value from the server process that actually handled the request.
-#[test_case(false; "plain")]
-#[test_case(true; "headers helper")]
+#[test_case(HeadersHelperMode::None; "plain")]
+#[test_case(HeadersHelperMode::Static; "headers helper")]
+#[test_case(HeadersHelperMode::Rotating; "headers helper refreshes rejected tool call")]
+#[test_case(HeadersHelperMode::RotatingAuthorization; "Authorization helper refreshes rejected tool call")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn streamable_http_tool_call_round_trip(with_headers_helper: bool) -> anyhow::Result<()> {
+async fn streamable_http_tool_call_round_trip(mode: HeadersHelperMode) -> anyhow::Result<()> {
+    let with_headers_helper = !matches!(mode, HeadersHelperMode::None);
+    let helper_authorization = matches!(mode, HeadersHelperMode::RotatingAuthorization);
+    let refresh_rejected_call = matches!(
+        mode,
+        HeadersHelperMode::Rotating | HeadersHelperMode::RotatingAuthorization
+    );
     skip_if_no_network!(Ok(()));
     if with_headers_helper && is_remote_test_environment() {
         return Ok(());
@@ -3027,16 +3828,31 @@ async fn streamable_http_tool_call_round_trip(with_headers_helper: bool) -> anyh
     let expected_env_value = "propagated-env-http";
     let Some(http_server) = start_streamable_http_test_server(
         expected_env_value,
-        /*expected_token*/ None,
-        with_headers_helper.then_some("gateway-token"),
+        helper_authorization.then_some("gateway-token"),
+        (with_headers_helper && !helper_authorization).then_some("gateway-token"),
     )
     .await?
     else {
         return Ok(());
     };
     let server_url = http_server.url().to_string();
+    let helper_directory = tempdir()?;
+    let helper_invocations = helper_directory.path().join("helper-invocations");
     let http_headers_helper = with_headers_helper.then(|| {
-        if cfg!(windows) {
+        if refresh_rejected_call {
+            let authorization_arg = if helper_authorization {
+                " --authorization"
+            } else {
+                ""
+            };
+            format!(
+                "\"{}\" --http-headers-helper \"{}\"{authorization_arg}",
+                cargo_bin("test_streamable_http_server")
+                    .expect("streamable HTTP helper binary")
+                    .display(),
+                helper_invocations.display(),
+            )
+        } else if cfg!(windows) {
             r#"echo {"Proxy-Authorization":"Bearer gateway-token"}"#.to_string()
         } else {
             r#"printf '{"Proxy-Authorization":"Bearer gateway-token"}'"#.to_string()
@@ -3067,6 +3883,20 @@ async fn streamable_http_tool_call_round_trip(with_headers_helper: bool) -> anyh
         .build_with_auto_env(&server)
         .await?;
     wait_for_mcp_server(&fixture.codex, server_name).await?;
+
+    if refresh_rejected_call {
+        let control_url = http_server
+            .url()
+            .replace("/mcp", "/test/control/session-post-failure");
+        let response = HttpClientBuilder::new()
+            .build_direct()?
+            .post(control_url)
+            .bearer_auth("gateway-token")
+            .json(&json!({ "status": 401, "remaining": 1 }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
 
     // Phase 4: submit the user turn that should trigger the MCP tool call.
     fixture
@@ -3126,6 +3956,9 @@ async fn streamable_http_tool_call_round_trip(with_headers_helper: bool) -> anyh
         .and_then(Value::as_str)
         .expect("env snapshot inserted");
     assert_eq!(env_value, expected_env_value);
+    if refresh_rejected_call {
+        assert_eq!(fs::read_to_string(helper_invocations)?, "xx");
+    }
     // Phase 7: verify the scripted model calls were consumed and clean up the
     // placement-aware MCP server.
     wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -3433,7 +4266,8 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         "expired-access-token",
         refresh_token,
         OAuthCredentialExpiry::Expired,
-    )?;
+    )
+    .await?;
     let discovered_credential_name =
         credential_config.oauth_credential_name(discovered_server_name);
     write_fallback_oauth_tokens(
@@ -3443,7 +4277,8 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         expected_token,
         refresh_token,
         OAuthCredentialExpiry::Valid,
-    )?;
+    )
+    .await?;
 
     // Phase 4: configure Codex with the OAuth-backed Streamable HTTP MCP
     // server and build the fixture in the active local or remote-aware mode.
@@ -3451,6 +4286,10 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = false)
         .with_home(temp_home.clone())
         .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::McpOAuthRefreshCoordination)
+                .expect("test config should allow coordinated MCP OAuth refresh");
             config.mcp_oauth_credentials_store_mode = OAuthCredentialsStoreMode::Auto;
             insert_mcp_server(
                 config,
@@ -3567,6 +4406,7 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         Some("OAuth sign-in is still pending."),
     );
 
+    let current_config = fixture.codex.config().await;
     let mut refreshed_config = fixture.config.clone();
     let mut refreshed_servers = refreshed_config.mcp_servers.get().clone();
     let discovered_server = refreshed_servers
@@ -3579,9 +4419,9 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         .set(refreshed_servers)
         .expect("test MCP servers should accept the discovered OAuth server");
     let discovered_turn = tokio::time::timeout(Duration::from_secs(5), async {
-        fixture
+        let _ = fixture
             .codex
-            .refresh_runtime_config(refreshed_config.clone())
+            .refresh_runtime_config(current_config, refreshed_config.clone())
             .await;
         fixture
             .codex
@@ -3616,13 +4456,20 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
     .await
     .context("the newly discovered OAuth server did not recover after its store was unlocked")??;
 
-    assert!(codex_rmcp_client::delete_oauth_tokens(
-        discovered_credential_name.as_ref(),
-        http_server.url(),
-        OAuthCredentialsStoreMode::File,
-        codex_config::types::AuthKeyringBackendKind::default(),
-    )?);
-    fixture.codex.refresh_runtime_config(refreshed_config).await;
+    assert!(
+        codex_rmcp_client::delete_oauth_tokens(
+            discovered_credential_name.as_ref(),
+            http_server.url(),
+            OAuthCredentialsStoreMode::File,
+            codex_config::types::AuthKeyringBackendKind::default(),
+        )
+        .await?
+    );
+    let current_config = fixture.codex.config().await;
+    let _ = fixture
+        .codex
+        .refresh_runtime_config(current_config, refreshed_config)
+        .await;
     let logged_out_startup = tokio::time::timeout(
         Duration::from_secs(5),
         wait_for_event(&fixture.codex, |event| {
@@ -3649,7 +4496,8 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         expected_token,
         refresh_token,
         OAuthCredentialExpiry::Valid,
-    )?;
+    )
+    .await?;
 
     // Phase 6: submit the user turn that should invoke the OAuth-backed tool.
     fixture
@@ -4090,7 +4938,7 @@ enum OAuthCredentialExpiry {
     Expired,
 }
 
-fn write_fallback_oauth_tokens(
+async fn write_fallback_oauth_tokens(
     server_name: &str,
     server_url: &str,
     client_id: &str,
@@ -4127,6 +4975,7 @@ fn write_fallback_oauth_tokens(
         OAuthCredentialsStoreMode::File,
         codex_config::types::AuthKeyringBackendKind::default(),
     )
+    .await
 }
 
 struct EnvVarGuard {

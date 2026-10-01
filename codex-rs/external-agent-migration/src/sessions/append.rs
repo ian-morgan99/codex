@@ -71,6 +71,7 @@ pub async fn append_existing_session(
     }
     if thread_store
         .resume_thread(ResumeThreadParams {
+            history_revision: None,
             thread_id,
             rollout_path: Some(rollout_path),
             history: None,
@@ -217,7 +218,10 @@ fn source_model_items(items: &[RolloutItem]) -> Option<Vec<SourceModelItem<'_>>>
     let mut append_start_index = None;
     for (index, item) in items.iter().enumerate() {
         match item {
-            RolloutItem::SessionMeta(_) | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
+            RolloutItem::SessionMeta(_)
+            | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::TokenUsageRecord(_)
+            | RolloutItem::RealtimeItem(_) => {}
             RolloutItem::ResponseItem(response_item) => {
                 model_items.push(SourceModelItem {
                     response_item: &response_item.item,
@@ -241,6 +245,7 @@ fn source_model_items(items: &[RolloutItem]) -> Option<Vec<SourceModelItem<'_>>>
             | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::Compacted(_)
             | RolloutItem::TurnContext(_)
+            | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::WorldState(_) => return None,
             RolloutItem::EventMsg(_) => {}
@@ -255,6 +260,9 @@ fn history_model_items(items: &[RolloutItem]) -> Option<Vec<&ResponseItem>> {
         match item {
             RolloutItem::SessionMeta(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::TokenUsageRecord(_)
+            | RolloutItem::RealtimeItem(_)
+            | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_) => {}
             RolloutItem::ResponseItem(response_item) => model_items.push(&response_item.item),
             RolloutItem::EventMsg(

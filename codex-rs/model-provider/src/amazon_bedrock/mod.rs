@@ -1,8 +1,10 @@
 mod auth;
 mod auth_refresh;
 mod catalog;
+mod credential_export;
 mod error;
 mod mantle;
+mod region;
 mod runtime;
 mod runtime_catalog;
 
@@ -15,7 +17,6 @@ use codex_api::SharedAuthProvider;
 use codex_api::TransportError;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
-use codex_login::auth::BedrockApiKeyAuth;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_TERRA_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_RUNTIME_GLOBAL_GPT_5_6_LUNA_MODEL_ID;
@@ -35,6 +36,7 @@ use crate::provider::ModelProvider;
 use crate::provider::ModelProviderFuture;
 use crate::provider::ProviderAccountResult;
 use crate::provider::ProviderAccountState;
+use crate::provider::ProviderAuthRecoveryMessages;
 use crate::provider::ProviderCapabilities;
 use crate::provider::ProviderUnauthorizedRecovery;
 use crate::provider::RemoteCompactionSupport;
@@ -42,9 +44,13 @@ use crate::shared_state::process_shared_state;
 use auth::resolve_provider_auth as resolve_bedrock_provider_auth;
 pub(crate) use auth_refresh::AwsAuthRecovery;
 use catalog::normalize_bedrock_catalog;
+use catalog::static_gov_model_catalog;
 pub(crate) use catalog::static_model_catalog;
+pub(crate) use credential_export::AwsCredentialExport;
 use mantle::bedrock_mantle_runtime_base_url;
+pub use mantle::is_amazon_bedrock_gov_cloud_region;
 pub use mantle::is_supported_amazon_bedrock_region;
+pub use region::resolve_amazon_bedrock_region;
 use runtime::bedrock_runtime_base_url;
 use runtime_catalog::static_runtime_model_catalog;
 
@@ -57,10 +63,12 @@ pub(super) enum BedrockEndpoint {
 /// Runtime provider for Amazon Bedrock's OpenAI-compatible endpoints.
 #[derive(Clone, Debug)]
 pub(crate) struct AmazonBedrockModelProvider {
+    http_client_factory: codex_http_client::HttpClientFactory,
     pub(crate) info: ModelProviderInfo,
     aws: ModelProviderAwsAuthInfo,
     endpoint: BedrockEndpoint,
     auth_manager: Option<Arc<AuthManager>>,
+    credential_export: Option<Arc<AwsCredentialExport>>,
     auth_recovery: Option<Arc<AwsAuthRecovery>>,
 }
 
@@ -80,23 +88,46 @@ impl AmazonBedrockModelProvider {
             .unwrap_or(ModelProviderAwsAuthInfo {
                 profile: None,
                 region: None,
+                credential_export: None,
                 auth_refresh: None,
             });
+        let auth_source = auth::auth_source(&provider_info, auth_manager.as_deref(), std::env::var);
+        let credential_export = if auth_source == auth::BedrockAuthSource::CredentialExport {
+            process_shared_state().aws_credential_export(&aws)
+        } else {
+            None
+        };
         let uses_aws_sdk_auth = matches!(
-            auth::auth_source(&provider_info, auth_manager.as_deref(), std::env::var),
-            auth::BedrockAuthSource::ConfiguredAwsProfile | auth::BedrockAuthSource::AwsSdk
+            auth_source,
+            auth::BedrockAuthSource::CredentialExport
+                | auth::BedrockAuthSource::ConfiguredAwsProfile
+                | auth::BedrockAuthSource::AwsSdk
         );
         let auth_recovery = if uses_aws_sdk_auth && aws.auth_refresh.is_some() {
             process_shared_state().aws_auth_recovery(&aws)
         } else {
             None
         };
+        let http_client_factory = auth_manager
+            .as_ref()
+            .map(|manager| {
+                manager
+                    .http_client_factory()
+                    .with_network_policy(manager.application_network_policy())
+            })
+            .unwrap_or_else(|| {
+                codex_http_client::HttpClientFactory::new(
+                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+                )
+            });
         let auth_manager = auth_manager_for_provider(auth_manager, &provider_info);
         Self {
+            http_client_factory,
             info: provider_info,
             aws,
             endpoint,
             auth_manager,
+            credential_export,
             auth_recovery,
         }
     }
@@ -105,30 +136,33 @@ impl AmazonBedrockModelProvider {
         auth::auth_source(&self.info, self.auth_manager.as_deref(), std::env::var)
     }
 
-    fn managed_auth(&self) -> Option<BedrockApiKeyAuth> {
-        if self.auth_source() != auth::BedrockAuthSource::ManagedBearerToken {
-            return None;
-        }
+    fn managed_auth(&self) -> Option<CodexAuth> {
+        let source = self.auth_source();
         self.auth_manager
-            .as_ref()
-            .and_then(|auth_manager| auth_manager.auth_cached())
-            .and_then(|auth| match auth {
-                CodexAuth::BedrockApiKey(auth) => Some(auth),
-                CodexAuth::ApiKey(_)
-                | CodexAuth::Chatgpt(_)
-                | CodexAuth::ChatgptAuthTokens(_)
-                | CodexAuth::Headers(_)
-                | CodexAuth::AgentIdentity(_)
-                | CodexAuth::PersonalAccessToken(_) => None,
+            .as_deref()
+            .and_then(AuthManager::auth_cached)
+            .filter(|auth| {
+                matches!(
+                    (source, auth),
+                    (
+                        auth::BedrockAuthSource::ManagedBearerToken,
+                        CodexAuth::BedrockApiKey(_)
+                    ) | (
+                        auth::BedrockAuthSource::ManagedAccessKeys,
+                        CodexAuth::BedrockAccessKeys(_)
+                    )
+                )
             })
     }
 
     fn uses_aws_auth_recovery(&self) -> bool {
-        self.auth_recovery.is_some()
-            && matches!(
-                self.auth_source(),
-                auth::BedrockAuthSource::ConfiguredAwsProfile | auth::BedrockAuthSource::AwsSdk
-            )
+        let source = self.auth_source();
+        source == auth::BedrockAuthSource::CredentialExport
+            || (self.auth_recovery.is_some()
+                && matches!(
+                    source,
+                    auth::BedrockAuthSource::ConfiguredAwsProfile | auth::BedrockAuthSource::AwsSdk
+                ))
     }
 
     async fn auth(&self) -> Option<CodexAuth> {
@@ -137,10 +171,10 @@ impl AmazonBedrockModelProvider {
                 Some(auth_manager) => auth_manager.auth().await,
                 None => None,
             },
-            auth::BedrockAuthSource::ManagedBearerToken => {
-                self.managed_auth().map(CodexAuth::BedrockApiKey)
-            }
-            auth::BedrockAuthSource::ConfiguredAwsProfile
+            auth::BedrockAuthSource::ManagedBearerToken
+            | auth::BedrockAuthSource::ManagedAccessKeys => self.managed_auth(),
+            auth::BedrockAuthSource::CredentialExport
+            | auth::BedrockAuthSource::ConfiguredAwsProfile
             | auth::BedrockAuthSource::EnvBearerToken
             | auth::BedrockAuthSource::EnvAwsCredentials
             | auth::BedrockAuthSource::AwsSdk => None,
@@ -157,21 +191,44 @@ impl AmazonBedrockModelProvider {
         if let Some(base_url) = self.info.base_url.clone() {
             return Ok(Some(base_url));
         }
+        let http_client_factory = self.http_client_factory.clone().with_network_policy(
+            self.http_client_factory
+                .network_policy()
+                .clone()
+                .for_current_account(),
+        );
         let auth_source = self.auth_source();
         let managed_auth = self.managed_auth();
         let base_url = match self.endpoint {
             BedrockEndpoint::Mantle => {
-                bedrock_mantle_runtime_base_url(auth_source, managed_auth.as_ref(), &self.aws)
-                    .await?
+                bedrock_mantle_runtime_base_url(
+                    auth_source,
+                    managed_auth.as_ref(),
+                    &self.aws,
+                    &http_client_factory,
+                )
+                .await?
             }
             BedrockEndpoint::Runtime => {
-                bedrock_runtime_base_url(auth_source, managed_auth.as_ref(), &self.aws).await?
+                bedrock_runtime_base_url(
+                    auth_source,
+                    managed_auth.as_ref(),
+                    &self.aws,
+                    &http_client_factory,
+                )
+                .await?
             }
         };
         Ok(Some(base_url))
     }
 
     async fn api_auth(&self) -> Result<SharedAuthProvider> {
+        let http_client_factory = self.http_client_factory.clone().with_network_policy(
+            self.http_client_factory
+                .network_policy()
+                .clone()
+                .for_current_account(),
+        );
         let source = self.auth_source();
         if source == auth::BedrockAuthSource::CommandBearerToken {
             let auth = self.auth().await;
@@ -179,12 +236,37 @@ impl AmazonBedrockModelProvider {
         }
 
         let managed_auth = self.managed_auth();
-        resolve_bedrock_provider_auth(source, managed_auth.as_ref(), &self.aws, self.endpoint).await
+        resolve_bedrock_provider_auth(
+            source,
+            managed_auth.as_ref(),
+            &self.aws,
+            self.endpoint,
+            &http_client_factory,
+        )
+        .await
     }
 
     fn default_model_catalog(&self) -> ModelsResponse {
         match self.endpoint {
-            BedrockEndpoint::Mantle => static_model_catalog(),
+            BedrockEndpoint::Mantle => {
+                let endpoint = self
+                    .info
+                    .base_url
+                    .as_deref()
+                    .and_then(|base_url| url::Url::parse(base_url).ok());
+                let is_govcloud =
+                    endpoint
+                        .as_ref()
+                        .and_then(url::Url::host_str)
+                        .is_some_and(|host| {
+                            host.starts_with("bedrock-mantle.us-gov-") && host.ends_with(".api.aws")
+                        });
+                if is_govcloud {
+                    static_gov_model_catalog()
+                } else {
+                    static_model_catalog()
+                }
+            }
             BedrockEndpoint::Runtime => static_runtime_model_catalog(),
         }
     }
@@ -229,8 +311,10 @@ impl ModelProvider for AmazonBedrockModelProvider {
     fn auth_manager(&self) -> Option<Arc<AuthManager>> {
         match self.auth_source() {
             auth::BedrockAuthSource::CommandBearerToken
-            | auth::BedrockAuthSource::ManagedBearerToken => self.auth_manager.clone(),
-            auth::BedrockAuthSource::ConfiguredAwsProfile
+            | auth::BedrockAuthSource::ManagedBearerToken
+            | auth::BedrockAuthSource::ManagedAccessKeys => self.auth_manager.clone(),
+            auth::BedrockAuthSource::CredentialExport
+            | auth::BedrockAuthSource::ConfiguredAwsProfile
             | auth::BedrockAuthSource::EnvBearerToken
             | auth::BedrockAuthSource::EnvAwsCredentials
             | auth::BedrockAuthSource::AwsSdk => None,
@@ -244,20 +328,61 @@ impl ModelProvider for AmazonBedrockModelProvider {
         ) || (self.uses_aws_auth_recovery() && error::is_refreshable_auth_error(error))
     }
 
+    fn auth_recovery_messages(&self) -> Option<ProviderAuthRecoveryMessages> {
+        self.uses_aws_auth_recovery()
+            .then_some(ProviderAuthRecoveryMessages {
+                started: "AWS session has expired. Reauthenticating...",
+                succeeded: "Signed in with AWS.",
+            })
+    }
+
     fn recover_from_unauthorized(
         &self,
     ) -> ModelProviderFuture<'_, Result<ProviderUnauthorizedRecovery>> {
         Box::pin(async move {
-            let Some(recovery) = self
-                .auth_recovery
-                .as_ref()
-                .filter(|_| self.uses_aws_auth_recovery())
-            else {
+            if !self.uses_aws_auth_recovery() {
                 return Ok(ProviderUnauthorizedRecovery::NotConfigured);
-            };
+            }
 
-            recovery.refresh().await.map_err(|error| {
-                if error.kind() == std::io::ErrorKind::InvalidInput {
+            // Hold the cache guard across both steps so concurrent callers share recovery.
+            let export_refresh = if let Some(exporter) = &self.credential_export {
+                let refresh = exporter.begin_refresh().await;
+                if refresh.is_none() {
+                    // Another caller completed recovery while we were waiting.
+                    return Ok(ProviderUnauthorizedRecovery::Recovered);
+                }
+                refresh
+            } else {
+                None
+            };
+            let network_policy = self
+                .http_client_factory
+                .network_policy()
+                .clone()
+                .for_current_account();
+            let permit = network_policy
+                .acquire_for_unsupported_sdk()
+                .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+            let result: std::io::Result<()> = permit
+                .run(async {
+                    if let Some(recovery) = &self.auth_recovery {
+                        recovery.refresh().await?;
+                    }
+                    if let Some(exporter) = export_refresh {
+                        exporter.refresh().await?;
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+            result.map_err(|error| {
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::InvalidData
+                        | std::io::ErrorKind::InvalidInput
+                        | std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::PermissionDenied
+                ) {
                     CodexErr::InvalidRequest(error.to_string())
                 } else {
                     CodexErr::Io(error)
@@ -274,8 +399,11 @@ impl ModelProvider for AmazonBedrockModelProvider {
     fn account_state(&self) -> ProviderAccountResult {
         Ok(ProviderAccountState {
             account: Some(ProviderAccount::AmazonBedrock {
-                uses_codex_managed_credentials: self.auth_source()
-                    == auth::BedrockAuthSource::ManagedBearerToken,
+                uses_codex_managed_credentials: matches!(
+                    self.auth_source(),
+                    auth::BedrockAuthSource::ManagedBearerToken
+                        | auth::BedrockAuthSource::ManagedAccessKeys
+                ),
             }),
             requires_openai_auth: false,
         })
@@ -329,6 +457,8 @@ mod error_tests;
 mod tests {
     use std::num::NonZeroU64;
 
+    use codex_login::auth::BedrockAccessKeysAuth;
+    use codex_login::auth::BedrockApiKeyAuth;
     use codex_model_provider_info::AwsAuthRefreshConfig;
     use codex_protocol::config_types::ModelProviderAuthInfo;
     use http::HeaderValue;
@@ -374,6 +504,7 @@ mod tests {
         provider_info.aws = Some(ModelProviderAwsAuthInfo {
             profile: Some("aws-profile-that-should-not-be-loaded".to_string()),
             region: Some("us-west-2".to_string()),
+            credential_export: None,
             auth_refresh: Some(AwsAuthRefreshConfig {
                 command: "aws".to_string(),
                 args: vec!["login".into()],
@@ -409,6 +540,7 @@ mod tests {
         regional_provider_info.aws = Some(ModelProviderAwsAuthInfo {
             profile: None,
             region: Some("us-west-2".to_string()),
+            credential_export: None,
             auth_refresh: None,
         });
         let regional_provider =
@@ -434,6 +566,7 @@ mod tests {
         let aws = ModelProviderAwsAuthInfo {
             profile: None,
             region: Some("us-west-2".to_string()),
+            credential_export: None,
             auth_refresh: Some(AwsAuthRefreshConfig {
                 command: "aws".to_string(),
                 args: vec!["login".into()],
@@ -482,42 +615,52 @@ mod tests {
         );
         assert!(!provider.uses_aws_auth_recovery());
 
-        let configured_profile_provider = AmazonBedrockModelProvider::new(
-            ModelProviderInfo::create_amazon_bedrock_provider(Some(ModelProviderAwsAuthInfo {
-                profile: Some("configured-aws-profile".to_string()),
-                ..aws
-            })),
-            Some(auth_manager),
+        let access_keys_auth_manager = AuthManager::from_auth_for_testing(
+            CodexAuth::BedrockAccessKeys(BedrockAccessKeysAuth {
+                access_key_id: "managed-access-key-id".to_string(),
+                secret_access_key: "managed-secret-access-key".to_string(),
+                session_token: None,
+            }),
         );
 
-        assert!(configured_profile_provider.auth_manager().is_none());
-        assert_eq!(configured_profile_provider.auth().await, None);
-        assert_eq!(
-            configured_profile_provider.account_state(),
-            Ok(ProviderAccountState {
-                account: Some(ProviderAccount::AmazonBedrock {
-                    uses_codex_managed_credentials: false,
-                }),
-                requires_openai_auth: false,
-            })
-        );
-        assert_eq!(
-            configured_profile_provider
-                .runtime_base_url()
-                .await
-                .expect("configured AWS profile region should resolve"),
-            Some("https://bedrock-mantle.us-west-2.api.aws/openai/v1".to_string())
-        );
-        assert!(
-            configured_profile_provider
-                .api_auth()
-                .await
-                .expect("configured AWS profile auth should resolve")
-                .to_auth_headers()
-                .get(http::header::AUTHORIZATION)
-                .is_none()
-        );
-        assert!(configured_profile_provider.uses_aws_auth_recovery());
+        for auth_manager in [auth_manager, access_keys_auth_manager] {
+            let configured_profile_provider = AmazonBedrockModelProvider::new(
+                ModelProviderInfo::create_amazon_bedrock_provider(Some(ModelProviderAwsAuthInfo {
+                    profile: Some("configured-aws-profile".to_string()),
+                    ..aws.clone()
+                })),
+                Some(auth_manager),
+            );
+
+            assert!(configured_profile_provider.auth_manager().is_none());
+            assert_eq!(configured_profile_provider.auth().await, None);
+            assert_eq!(
+                configured_profile_provider.account_state(),
+                Ok(ProviderAccountState {
+                    account: Some(ProviderAccount::AmazonBedrock {
+                        uses_codex_managed_credentials: false,
+                    }),
+                    requires_openai_auth: false,
+                })
+            );
+            assert_eq!(
+                configured_profile_provider
+                    .runtime_base_url()
+                    .await
+                    .expect("configured AWS profile region should resolve"),
+                Some("https://bedrock-mantle.us-west-2.api.aws/openai/v1".to_string())
+            );
+            assert!(
+                configured_profile_provider
+                    .api_auth()
+                    .await
+                    .expect("configured AWS profile auth should resolve")
+                    .to_auth_headers()
+                    .get(http::header::AUTHORIZATION)
+                    .is_none()
+            );
+            assert!(configured_profile_provider.uses_aws_auth_recovery());
+        }
     }
 
     #[tokio::test]

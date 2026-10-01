@@ -1,3 +1,4 @@
+use std::sync::LazyLock;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -39,17 +40,34 @@ pub(crate) async fn run_mcp_tool(
         let hook_event: Value =
             serde_json::from_str(hook_event_json).context("failed to parse hook event input")?;
         let input = expand_mcp_argument_template(argument_template, &hook_event)?;
+        let (environment_id, mut call_metadata) = match &handler.source_path {
+            HandlerSourcePath::Local(_) => (None, None),
+            HandlerSourcePath::ExecutorScoped {
+                environment_id,
+                mcp_environment_id,
+                mcp_metadata,
+                ..
+            } => (
+                Some(
+                    mcp_environment_id
+                        .as_ref()
+                        .unwrap_or(environment_id)
+                        .clone(),
+                ),
+                mcp_metadata.as_deref().cloned(),
+            ),
+        };
+        if let Some(metadata) = metadata {
+            call_metadata
+                .get_or_insert_with(Map::new)
+                .extend(metadata.clone());
+        }
         executor
             .execute(HookMcpCall {
                 server: server.to_string(),
                 tool: tool.to_string(),
-                environment_id: match &handler.source_path {
-                    HandlerSourcePath::Local(_) => None,
-                    HandlerSourcePath::ExecutorScoped { environment_id, .. } => {
-                        Some(environment_id.clone())
-                    }
-                },
-                metadata: metadata.cloned(),
+                environment_id,
+                metadata: call_metadata,
                 input,
                 timeout: Duration::from_secs(handler.timeout_sec),
             })
@@ -104,7 +122,9 @@ fn resolve_value(value: &Value, hook_event: &Value) -> Result<Value> {
 }
 
 fn resolve_string(text: &str, hook_event: &Value) -> Result<Value> {
-    let pattern = Regex::new(r"\$\{([^{}]+)\}")?;
+    static PLACEHOLDER_PATTERN: LazyLock<Result<Regex, regex::Error>> =
+        LazyLock::new(|| Regex::new(r"\$\{([^{}]+)\}"));
+    let pattern = PLACEHOLDER_PATTERN.as_ref().map_err(Clone::clone)?;
     let captures = pattern.captures_iter(text).collect::<Vec<_>>();
     if captures.is_empty() {
         return Ok(Value::String(text.to_string()));

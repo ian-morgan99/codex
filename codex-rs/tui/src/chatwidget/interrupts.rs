@@ -1,4 +1,6 @@
-//! Queue prompt overlays and deferred tool activity while another interrupt is visible.
+//! Defer prompt overlays and tool activity until assistant streams finish.
+//!
+//! Turn termination settles background activity without opening queued prompts.
 
 use std::collections::VecDeque;
 
@@ -93,6 +95,21 @@ impl InterruptManager {
         self.queue.push_back(QueuedInterrupt::ItemCompleted(item));
     }
 
+    /// Settle background activity at turn end without opening queued prompts.
+    pub(crate) fn flush_activity(&mut self, chat: &mut ChatWidget) {
+        let mut pending_prompts = VecDeque::new();
+        while let Some(queued) = self.queue.pop_front() {
+            match queued {
+                QueuedInterrupt::ItemStarted(item) => chat.handle_queued_item_started_now(item),
+                QueuedInterrupt::ItemCompleted(item) => {
+                    chat.handle_queued_item_completed_now(item);
+                }
+                prompt => pending_prompts.push_back(prompt),
+            }
+        }
+        self.queue = pending_prompts;
+    }
+
     pub(crate) fn remove_resolved_prompt(&mut self, request: &ResolvedAppServerRequest) -> bool {
         if !self.has_pending_prompt() {
             return false;
@@ -176,6 +193,7 @@ mod tests {
 
     fn exec_approval(call_id: &str, approval_id: Option<&str>) -> ExecApprovalRequestEvent {
         ExecApprovalRequestEvent {
+            kind: Default::default(),
             call_id: call_id.to_string(),
             approval_id: approval_id.map(str::to_string),
             turn_id: "turn".to_string(),
@@ -193,6 +211,8 @@ mod tests {
 
     fn command_execution(call_id: &str) -> ThreadItem {
         ThreadItem::CommandExecution {
+            model_context: None,
+            sandbox_type: None,
             id: call_id.to_string(),
             command: "true".to_string(),
             cwd: AbsolutePathBuf::current_dir().expect("current dir").into(),

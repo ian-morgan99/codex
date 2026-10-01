@@ -40,6 +40,7 @@ use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::Renderable;
 use codex_app_server_protocol::AdditionalPermissionProfile;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
+use codex_app_server_protocol::CommandExecutionApprovalKind;
 use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::FileSystemAccessMode;
 use codex_app_server_protocol::FileSystemPath;
@@ -79,6 +80,7 @@ pub(crate) enum ApprovalRequest {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ExecApprovalRequest {
+    pub kind: CommandExecutionApprovalKind,
     pub thread_id: ThreadId,
     pub thread_label: Option<String>,
     pub id: String,
@@ -250,23 +252,35 @@ impl ApprovalOverlay {
         list_keymap: &ListKeymap,
     ) -> (Vec<ApprovalOption>, SelectionViewParams) {
         let (options, title) = match request {
-            ApprovalRequest::Exec(request) => (
-                exec_options(
-                    &request.available_decisions,
-                    request.network_approval_context.as_ref(),
-                    request.additional_permissions.as_ref(),
-                    approval_keymap,
-                ),
-                request.network_approval_context.as_ref().map_or_else(
-                    || "Would you like to run the following command?".to_string(),
-                    |network_approval_context| {
-                        format!(
-                            "Do you want to approve network access to \"{}\"?",
-                            network_approval_context.host
-                        )
-                    },
-                ),
-            ),
+            ApprovalRequest::Exec(request) => {
+                let title = if request.kind == CommandExecutionApprovalKind::WriteStdin {
+                    request.command.get(2).map_or_else(
+                        || "Would you like to send input to the existing terminal?".to_string(),
+                        |process_id| {
+                            format!("Would you like to send input to terminal {process_id}?")
+                        },
+                    )
+                } else {
+                    request.network_approval_context.as_ref().map_or_else(
+                        || "Would you like to run the following command?".to_string(),
+                        |network_approval_context| {
+                            format!(
+                                "Do you want to approve network access to \"{}\"?",
+                                network_approval_context.host
+                            )
+                        },
+                    )
+                };
+                (
+                    exec_options(
+                        &request.available_decisions,
+                        request.network_approval_context.as_ref(),
+                        request.additional_permissions.as_ref(),
+                        approval_keymap,
+                    ),
+                    title,
+                )
+            }
             ApprovalRequest::Permissions(_) => (
                 permissions_options(approval_keymap),
                 "Would you like to grant these permissions?".to_string(),
@@ -282,7 +296,9 @@ impl ApprovalOverlay {
         };
 
         let header = Box::new(ColumnRenderable::with([
-            Line::from(title.bold()).into(),
+            Paragraph::new(title.bold())
+                .wrap(Wrap { trim: false })
+                .into(),
             Line::from("").into(),
             header,
         ]));
@@ -301,7 +317,9 @@ impl ApprovalOverlay {
             footer_hint: Some(approval_footer_hint(request, approval_keymap, list_keymap)),
             items,
             header,
-            ..Default::default()
+            header_view_all_hint: approval_keymap
+                .primary_hint("open_fullscreen", &approval_keymap.open_fullscreen),
+            ..SelectionViewParams::picker()
         };
 
         (options, params)
@@ -700,17 +718,22 @@ fn build_header(request: &ApprovalRequest) -> Box<dyn Renderable> {
             {
                 header.push(Line::from(vec![
                     "Permission rule: ".into(),
-                    rule_line.cyan(),
+                    rule_line.fg(crate::style::accent_color()),
                 ]));
                 header.push(Line::from(""));
             }
-            let full_cmd = strip_bash_lc_and_escape(&request.command);
-            let mut full_cmd_lines = highlight_bash_to_lines(&full_cmd);
-            if let Some(first) = full_cmd_lines.first_mut() {
-                first.spans.insert(0, Span::from("$ "));
-            }
-            if request.network_approval_context.is_none() {
-                header.extend(full_cmd_lines);
+            if request.kind == CommandExecutionApprovalKind::WriteStdin {
+                let input = request.command.last().map_or("", String::as_str);
+                header.push(vec!["Input: ".into(), format!("{input:?}").into()].into());
+            } else {
+                let full_cmd = strip_bash_lc_and_escape(&request.command);
+                let mut full_cmd_lines = highlight_bash_to_lines(&full_cmd);
+                if let Some(first) = full_cmd_lines.first_mut() {
+                    first.spans.insert(0, Span::from("$ "));
+                }
+                if request.network_approval_context.is_none() {
+                    header.extend(full_cmd_lines);
+                }
             }
             Box::new(Paragraph::new(header).wrap(Wrap { trim: false }))
         }
@@ -737,7 +760,7 @@ fn build_header(request: &ApprovalRequest) -> Box<dyn Renderable> {
             if let Some(rule_line) = format_requested_permissions_rule(&request.permissions) {
                 header.push(Line::from(vec![
                     "Permission rule: ".into(),
-                    rule_line.cyan(),
+                    rule_line.fg(crate::style::accent_color()),
                 ]));
             }
             Box::new(Paragraph::new(header).wrap(Wrap { trim: false }))
@@ -757,8 +780,7 @@ fn build_header(request: &ApprovalRequest) -> Box<dyn Renderable> {
                 Line::from(""),
                 Line::from(request.message.clone()),
             ]);
-            let header = Paragraph::new(lines).wrap(Wrap { trim: false });
-            Box::new(header)
+            Box::new(Paragraph::new(lines).wrap(Wrap { trim: false }))
         }
     }
 }
@@ -1187,6 +1209,7 @@ mod tests {
 
     fn make_exec_request() -> ApprovalRequest {
         ApprovalRequest::Exec(ExecApprovalRequest {
+            kind: Default::default(),
             thread_id: ThreadId::new(),
             thread_label: None,
             id: "test".to_string(),
@@ -1380,6 +1403,7 @@ mod tests {
         let tx = AppEventSender::new(tx);
         let mut view = make_overlay(
             ApprovalRequest::Exec(ExecApprovalRequest {
+                kind: Default::default(),
                 thread_id: ThreadId::new(),
                 thread_label: None,
                 id: "test".to_string(),
@@ -1424,6 +1448,7 @@ mod tests {
         };
         let mut view = make_overlay(
             ApprovalRequest::Exec(ExecApprovalRequest {
+                kind: Default::default(),
                 thread_id: ThreadId::new(),
                 thread_label: None,
                 id: "test".to_string(),
@@ -1509,6 +1534,7 @@ mod tests {
         let thread_id = ThreadId::new();
         let mut view = make_overlay(
             ApprovalRequest::Exec(ExecApprovalRequest {
+                kind: Default::default(),
                 thread_id,
                 thread_label: Some("Robie [explorer]".to_string()),
                 id: "test".to_string(),
@@ -1544,6 +1570,7 @@ mod tests {
         keymap.approval.open_thread = vec![key_hint::plain(KeyCode::Char('x'))];
         let mut view = make_overlay_with_keymap(
             ApprovalRequest::Exec(ExecApprovalRequest {
+                kind: Default::default(),
                 thread_id,
                 thread_label: Some("Robie [explorer]".to_string()),
                 id: "test".to_string(),
@@ -1583,6 +1610,7 @@ mod tests {
         let tx = AppEventSender::new(tx);
         let view = make_overlay(
             ApprovalRequest::Exec(ExecApprovalRequest {
+                kind: Default::default(),
                 thread_id: ThreadId::new(),
                 thread_label: Some("Robie [explorer]".to_string()),
                 id: "test".to_string(),
@@ -1612,6 +1640,7 @@ mod tests {
         let tx = AppEventSender::new(tx);
         let mut view = make_overlay(
             ApprovalRequest::Exec(ExecApprovalRequest {
+                kind: Default::default(),
                 thread_id: ThreadId::new(),
                 thread_label: None,
                 id: "test".to_string(),
@@ -1665,6 +1694,7 @@ mod tests {
         let tx = AppEventSender::new(tx);
         let mut view = make_overlay(
             ApprovalRequest::Exec(ExecApprovalRequest {
+                kind: Default::default(),
                 thread_id: ThreadId::new(),
                 thread_label: None,
                 id: "test".to_string(),
@@ -1705,6 +1735,7 @@ mod tests {
         let tx = AppEventSender::new(tx);
         let command = vec!["echo".into(), "hello".into(), "world".into()];
         let exec_request = ApprovalRequest::Exec(ExecApprovalRequest {
+            kind: Default::default(),
             thread_id: ThreadId::new(),
             thread_label: None,
             id: "test".into(),
@@ -2006,6 +2037,7 @@ mod tests {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
         let exec_request = ApprovalRequest::Exec(ExecApprovalRequest {
+            kind: Default::default(),
             thread_id: ThreadId::new(),
             thread_label: None,
             id: "test".into(),
@@ -2063,6 +2095,7 @@ mod tests {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
         let exec_request = ApprovalRequest::Exec(ExecApprovalRequest {
+            kind: Default::default(),
             thread_id: ThreadId::new(),
             thread_label: None,
             id: "test".into(),
@@ -2188,6 +2221,7 @@ mod tests {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
         let exec_request = ApprovalRequest::Exec(ExecApprovalRequest {
+            kind: Default::default(),
             thread_id: ThreadId::new(),
             thread_label: None,
             id: "test".into(),
@@ -2325,6 +2359,7 @@ mod tests {
         let tx = AppEventSender::new(tx_raw);
         let mut view = make_overlay(
             ApprovalRequest::Exec(ExecApprovalRequest {
+                kind: Default::default(),
                 thread_id: ThreadId::new(),
                 thread_label: None,
                 id: "test".into(),
@@ -2476,3 +2511,7 @@ mod tests {
         assert_eq!(decision, Some(CommandExecutionApprovalDecision::Accept));
     }
 }
+
+#[cfg(test)]
+#[path = "approval_overlay/clipping_tests.rs"]
+mod clipping_tests;

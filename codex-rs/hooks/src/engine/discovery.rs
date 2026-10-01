@@ -17,6 +17,8 @@ use codex_config::RequirementSource;
 use codex_config::TomlValue;
 use codex_config::version_for_toml;
 use codex_plugin::PluginHookSource;
+use codex_plugin::is_allowlisted_bundled_cleanup_hook;
+use codex_protocol::protocol::HookEventName;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
 use serde::Serialize;
@@ -25,9 +27,10 @@ use super::ConfiguredHandler;
 use super::ConfiguredHandlerKind;
 use super::HookListEntry;
 use super::HookListEntryHandler;
+use super::dispatcher::hook_event_name_label;
 use crate::config_rules::hook_states_from_stack;
+use crate::engine::HookMatcher;
 use crate::events::common::matcher_pattern_for_event;
-use crate::events::common::validate_matcher_pattern;
 use crate::events::session_end::SESSION_END_DEFAULT_TIMEOUT_SEC;
 use crate::events::session_end::SESSION_END_MAX_TIMEOUT_SEC;
 use crate::output_spill::AdditionalContextLimit;
@@ -483,20 +486,22 @@ fn append_matcher_groups(
 ) {
     for (group_index, group) in groups.into_iter().enumerate() {
         let matcher = matcher_pattern_for_event(event_name, group.matcher.as_deref());
-        if let Some(matcher) = matcher
-            && let Err(err) = validate_matcher_pattern(matcher)
-        {
-            let warning = format!(
-                "invalid matcher {matcher:?} in {}: {err}",
-                source.path.display()
-            );
-            if group.hooks.is_empty() {
-                warnings.push(warning);
-            } else {
-                source.record_load_failure(warning, warnings);
+        let compiled_matcher = match matcher.map(HookMatcher::new).transpose() {
+            Ok(matcher) => matcher,
+            Err(err) => {
+                let matcher = matcher.unwrap_or_default();
+                let warning = format!(
+                    "invalid matcher {matcher:?} in {}: {err}",
+                    source.path.display()
+                );
+                if group.hooks.is_empty() {
+                    warnings.push(warning);
+                } else {
+                    source.record_load_failure(warning, warnings);
+                }
+                continue;
             }
-            continue;
-        }
+        };
         for (handler_index, handler) in group.hooks.iter().cloned().enumerate() {
             let normalized = match handler {
                 HookHandlerConfig::Command {
@@ -525,11 +530,11 @@ fn append_matcher_groups(
                         source.path.as_path(),
                         warnings,
                     );
-                    let runs_async = r#async
-                        && event_name != codex_protocol::protocol::HookEventName::SessionEnd;
+                    let runs_async = r#async && event_name != HookEventName::SessionEnd;
                     if r#async && !runs_async {
                         warnings.push(format!(
-                            "running async SessionEnd hook synchronously in {}",
+                            "running async {} hook synchronously in {}",
+                            hook_event_name_label(event_name),
                             source.path.display()
                         ));
                     }
@@ -583,11 +588,12 @@ fn append_matcher_groups(
                     timeout_sec,
                     status_message,
                 } => {
-                    if event_name == codex_protocol::protocol::HookEventName::SessionEnd {
+                    if event_name == HookEventName::SessionEnd {
                         source.record_load_failure(
                             format!(
-                                "skipping MCP tool hook in {}: SessionEnd MCP hooks are not supported",
-                                source.path.display()
+                                "skipping MCP tool hook in {}: {} MCP hooks are not supported",
+                                source.path.display(),
+                                hook_event_name_label(event_name),
                             ),
                             warnings,
                         );
@@ -603,7 +609,12 @@ fn append_matcher_groups(
                         );
                         continue;
                     }
-                    let timeout_sec = timeout_sec.unwrap_or(600).max(1);
+                    let timeout_sec = normalize_command_hook(
+                        event_name,
+                        timeout_sec,
+                        source.path.as_path(),
+                        warnings,
+                    );
                     let config = HookHandlerConfig::McpTool {
                         server: server.clone(),
                         tool: tool.clone(),
@@ -652,12 +663,22 @@ fn append_matcher_groups(
                 status_message,
                 additional_context_limit,
             } = normalized;
-            let current_hash = hook_hash(event_name, matcher, &group, config);
+            let current_hash = hook_hash(event_name, matcher, &group, &config);
             let key = crate::hook_key(&source.key_source, event_name, group_index, handler_index);
             let state = source.hook_states.get(&key);
-            let enabled = hook_enabled(source.is_managed, state);
+            let builtin = source.plugin_id.as_deref().is_some_and(|plugin_id| {
+                is_allowlisted_bundled_cleanup_hook(
+                    plugin_id,
+                    event_name,
+                    group.matcher.as_deref(),
+                    &config,
+                    /*app_connector_id*/ None,
+                )
+            });
+            let enabled = hook_enabled(source.is_managed, builtin, state);
             let trusted_hash = hook_trusted_hash(source.is_managed, state);
-            let trust_status = hook_trust_status(source.is_managed, &current_hash, trusted_hash);
+            let trust_status =
+                hook_trust_status(source.is_managed, builtin, &current_hash, trusted_hash);
             let handler = match &kind {
                 ConfiguredHandlerKind::Command {
                     command, r#async, ..
@@ -674,6 +695,7 @@ fn append_matcher_groups(
             };
 
             hook_entries.push(HookListEntry {
+                builtin,
                 key,
                 event_name,
                 handler,
@@ -698,8 +720,9 @@ fn append_matcher_groups(
                     ))
             {
                 handlers.push(ConfiguredHandler {
+                    builtin,
                     event_name,
-                    matcher: matcher.map(ToOwned::to_owned),
+                    matcher: compiled_matcher.clone(),
                     timeout_sec,
                     status_message,
                     additional_context_limit: AdditionalContextLimit::from_config(
@@ -716,28 +739,30 @@ fn append_matcher_groups(
     }
 }
 
-/// Normalizes command-hook timeouts. SessionEnd defaults to one second and is capped at three
-/// seconds; all other command hooks keep the standard ten-minute default.
+/// Normalizes hook timeouts. SessionEnd and Interrupt default to one second and are capped at three
+/// seconds; all other hooks keep the standard ten-minute default.
 fn normalize_command_hook(
-    event_name: codex_protocol::protocol::HookEventName,
+    event_name: HookEventName,
     timeout_sec: Option<u64>,
     source_path: &Path,
     warnings: &mut Vec<String>,
 ) -> u64 {
-    if event_name != codex_protocol::protocol::HookEventName::SessionEnd {
-        return timeout_sec.unwrap_or(600).max(1);
+    match event_name {
+        HookEventName::SessionEnd | HookEventName::Interrupt => {
+            let max_timeout_sec = SESSION_END_MAX_TIMEOUT_SEC;
+            if timeout_sec.is_some_and(|timeout_sec| timeout_sec > max_timeout_sec) {
+                warnings.push(format!(
+                    "clamping {} hook timeout to {max_timeout_sec}s in {}",
+                    hook_event_name_label(event_name),
+                    source_path.display()
+                ));
+            }
+            timeout_sec
+                .unwrap_or(SESSION_END_DEFAULT_TIMEOUT_SEC)
+                .clamp(1, max_timeout_sec)
+        }
+        _ => timeout_sec.unwrap_or(600).max(1),
     }
-
-    let max_timeout_sec = SESSION_END_MAX_TIMEOUT_SEC;
-    if timeout_sec.is_some_and(|timeout_sec| timeout_sec > max_timeout_sec) {
-        warnings.push(format!(
-            "clamping SessionEnd hook timeout to {max_timeout_sec}s in {}",
-            source_path.display()
-        ));
-    }
-    timeout_sec
-        .unwrap_or(SESSION_END_DEFAULT_TIMEOUT_SEC)
-        .clamp(1, max_timeout_sec)
 }
 
 /// Hash a normalized, config-derived identity instead of source text so equivalent
@@ -753,11 +778,11 @@ fn hook_hash(
     event_name: codex_protocol::protocol::HookEventName,
     matcher: Option<&str>,
     group: &MatcherGroup,
-    normalized_handler: HookHandlerConfig,
+    normalized_handler: &HookHandlerConfig,
 ) -> String {
     let mut group = group.clone();
     group.matcher = matcher.map(ToOwned::to_owned);
-    group.hooks = vec![normalized_handler];
+    group.hooks = vec![normalized_handler.clone()];
     let identity = NormalizedHookIdentity {
         event_name: crate::hook_event_key_label(event_name),
         group,
@@ -770,10 +795,13 @@ fn hook_hash(
 
 fn hook_trust_status(
     is_managed: bool,
+    is_builtin: bool,
     current_hash: &str,
     trusted_hash: Option<&str>,
 ) -> HookTrustStatus {
-    if is_managed {
+    if is_builtin {
+        HookTrustStatus::Trusted
+    } else if is_managed {
         HookTrustStatus::Managed
     } else {
         match trusted_hash {
@@ -784,8 +812,8 @@ fn hook_trust_status(
     }
 }
 
-fn hook_enabled(is_managed: bool, state: Option<&HookStateToml>) -> bool {
-    is_managed || state.and_then(|state| state.enabled) != Some(false)
+fn hook_enabled(is_managed: bool, is_builtin: bool, state: Option<&HookStateToml>) -> bool {
+    is_builtin || is_managed || state.and_then(|state| state.enabled) != Some(false)
 }
 
 fn hook_trusted_hash(is_managed: bool, state: Option<&HookStateToml>) -> Option<&str> {
@@ -836,11 +864,13 @@ fn hook_source_for_requirement_source(source: Option<&RequirementSource>) -> Hoo
 
 #[cfg(test)]
 mod tests {
+    use super::HookMatcher;
     use codex_config::ConfigLayerEntry;
     use codex_config::ConfigLayerSource;
     use codex_config::HookEventsToml;
     use codex_config::RequirementSource;
     use codex_protocol::protocol::HookEventName;
+    use codex_protocol::protocol::HookExecutionMode;
     use codex_protocol::protocol::HookSource;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use codex_utils_absolute_path::test_support::PathBufExt;
@@ -852,6 +882,7 @@ mod tests {
     use super::HookListEntry;
     use super::HookListEntryHandler;
     use super::append_matcher_groups;
+    use super::normalize_command_hook;
     use crate::output_spill::AdditionalContextLimit;
     use crate::output_spill::DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT;
     use codex_config::HookHandlerConfig;
@@ -1053,6 +1084,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn interrupt_mcp_tool_hooks_are_supported_and_timeout_is_clamped() {
+        let source_path = source_path();
+        let hook_states = std::collections::HashMap::new();
+        let mut handlers = Vec::new();
+        let mut entries = Vec::new();
+        let mut warnings = Vec::new();
+        let mut display_order = 0;
+
+        append_matcher_groups(
+            &mut handlers,
+            &mut entries,
+            &mut warnings,
+            &mut display_order,
+            &mut hook_handler_source(&source_path, &hook_states),
+            HookEventName::Interrupt,
+            vec![MatcherGroup {
+                matcher: None,
+                hooks: vec![
+                    HookHandlerConfig::McpTool {
+                        server: "security".to_string(),
+                        tool: "scan".to_string(),
+                        input: serde_json::Map::new(),
+                        timeout_sec: None,
+                        status_message: None,
+                    },
+                    HookHandlerConfig::McpTool {
+                        server: "security".to_string(),
+                        tool: "report".to_string(),
+                        input: serde_json::Map::new(),
+                        timeout_sec: Some(600),
+                        status_message: None,
+                    },
+                ],
+            }],
+        );
+
+        assert_eq!(
+            handlers
+                .iter()
+                .map(|handler| handler.timeout_sec)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.timeout_sec)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| matches!(entry.handler, HookListEntryHandler::McpTool { .. }))
+        );
+        assert_eq!(
+            warnings,
+            vec![format!(
+                "clamping Interrupt hook timeout to 3s in {}",
+                source_path.display()
+            )]
+        );
+    }
+
     fn discover_command(
         event_name: HookEventName,
         additional_context_limit: Option<usize>,
@@ -1161,6 +1257,7 @@ mod tests {
         assert_eq!(
             handlers,
             vec![ConfiguredHandler {
+                builtin: false,
                 event_name: HookEventName::UserPromptSubmit,
                 matcher: None,
                 timeout_sec: 600,
@@ -1200,8 +1297,9 @@ mod tests {
         assert_eq!(
             handlers,
             vec![ConfiguredHandler {
+                builtin: false,
                 event_name: HookEventName::PreToolUse,
-                matcher: Some("^Bash$".to_string()),
+                matcher: Some(HookMatcher::new("^Bash$").expect("valid matcher")),
                 timeout_sec: 600,
                 status_message: None,
                 additional_context_limit: Default::default(),
@@ -1271,7 +1369,7 @@ mod tests {
         assert_eq!(
             handlers
                 .iter()
-                .map(|handler| handler.matcher.as_deref())
+                .map(|handler| handler.matcher.as_ref().map(HookMatcher::as_str))
                 .collect::<Vec<_>>(),
             vec![Some("other"), Some("other")]
         );
@@ -1305,6 +1403,75 @@ mod tests {
                     source_path.display()
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn interrupt_normalizes_timeout_and_supports_async_execution() {
+        let mut handlers = Vec::new();
+        let mut hook_entries = Vec::new();
+        let mut warnings = Vec::new();
+        let mut display_order = 0;
+        let source_path = source_path();
+        let hook_states = std::collections::HashMap::new();
+
+        append_matcher_groups(
+            &mut handlers,
+            &mut hook_entries,
+            &mut warnings,
+            &mut display_order,
+            &mut hook_handler_source(&source_path, &hook_states),
+            HookEventName::Interrupt,
+            vec![MatcherGroup {
+                matcher: Some("ignored".to_string()),
+                hooks: vec![HookHandlerConfig::Command {
+                    command: "echo interrupt".to_string(),
+                    command_windows: None,
+                    timeout_sec: Some(600),
+                    r#async: true,
+                    status_message: None,
+                    additional_context_limit: None,
+                }],
+            }],
+        );
+
+        assert_eq!(
+            normalize_command_hook(
+                HookEventName::Interrupt,
+                /*timeout_sec*/ None,
+                source_path.as_path(),
+                &mut Vec::new(),
+            ),
+            1
+        );
+        assert_eq!(
+            handlers
+                .iter()
+                .map(|handler| (
+                    handler.timeout_sec,
+                    handler.matcher.as_ref().map(HookMatcher::as_str),
+                    handler.execution_mode()
+                ))
+                .collect::<Vec<_>>(),
+            vec![(3, None, HookExecutionMode::Async)]
+        );
+        assert_eq!(
+            hook_entries
+                .iter()
+                .map(|entry| (entry.timeout_sec, entry.matcher.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![(3, None)]
+        );
+        assert!(hook_entries.iter().all(|entry| matches!(
+            entry.handler,
+            HookListEntryHandler::Command { r#async: true, .. }
+        )));
+        assert_eq!(
+            warnings,
+            vec![format!(
+                "clamping Interrupt hook timeout to 3s in {}",
+                source_path.display()
+            )]
         );
     }
 
@@ -1394,7 +1561,10 @@ mod tests {
 
         assert_eq!(warnings, Vec::<String>::new());
         assert_eq!(handlers.len(), 1);
-        assert_eq!(handlers[0].matcher.as_deref(), Some("*"));
+        assert_eq!(
+            handlers[0].matcher.as_ref().map(HookMatcher::as_str),
+            Some("*")
+        );
     }
 
     #[test]
@@ -1418,7 +1588,10 @@ mod tests {
         assert_eq!(warnings, Vec::<String>::new());
         assert_eq!(handlers.len(), 1);
         assert_eq!(handlers[0].event_name, HookEventName::PostToolUse);
-        assert_eq!(handlers[0].matcher.as_deref(), Some("Edit|Write"));
+        assert_eq!(
+            handlers[0].matcher.as_ref().map(HookMatcher::as_str),
+            Some("Edit|Write")
+        );
     }
 
     #[test]

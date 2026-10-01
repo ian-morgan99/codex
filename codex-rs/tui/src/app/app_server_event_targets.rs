@@ -59,6 +59,9 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::ThreadNameUpdated(notification) => {
             Some(notification.thread_id.as_str())
         }
+        ServerNotification::ThreadAttachmentUpdated(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::ThreadProjectUpdated(notification) => {
             Some(notification.thread_id.as_str())
         }
@@ -66,6 +69,9 @@ pub(super) fn server_notification_thread_target(
             Some(notification.thread_id.as_str())
         }
         ServerNotification::ThreadGoalUpdated(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ThreadPredictionUpdated(notification) => {
             Some(notification.thread_id.as_str())
         }
         ServerNotification::ThreadGoalCleared(notification) => {
@@ -148,6 +154,15 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::ThreadRealtimeItemAdded(notification) => {
             Some(notification.thread_id.as_str())
         }
+        ServerNotification::ThreadRealtimeItemStarted(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeItemTranscriptDelta(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeItemCompleted(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::ThreadRealtimeTranscriptDelta(notification) => {
             Some(notification.thread_id.as_str())
         }
@@ -166,8 +181,18 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::ThreadRealtimeClosed(notification) => {
             Some(notification.thread_id.as_str())
         }
+        ServerNotification::AuthRecoveryStarted(notification)
+        | ServerNotification::AuthRecoveryCompleted(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::Warning(notification) => notification.thread_id.as_deref(),
         ServerNotification::GuardianWarning(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::McpServerOauthLoginCompleted(notification) => {
+            match notification.thread_id.as_deref() {
+                Some(thread_id) => Some(thread_id),
+                None => return ServerNotificationThreadTarget::AppScoped,
+            }
+        }
         ServerNotification::McpServerStatusUpdated(notification) => {
             match notification.thread_id.as_deref() {
                 Some(thread_id) => Some(thread_id),
@@ -176,8 +201,8 @@ pub(super) fn server_notification_thread_target(
         }
         ServerNotification::ProjectChanged(_)
         | ServerNotification::SkillsChanged(_)
-        | ServerNotification::McpServerOauthLoginCompleted(_)
         | ServerNotification::AccountUpdated(_)
+        | ServerNotification::GatewayOAuthChanged(_)
         | ServerNotification::AccountRateLimitsUpdated(_)
         | ServerNotification::AppListUpdated(_)
         | ServerNotification::EnvironmentConnected(_)
@@ -218,6 +243,8 @@ mod tests {
     use codex_app_server_protocol::McpServerStartupState;
     use codex_app_server_protocol::McpServerStatusUpdatedNotification;
     use codex_app_server_protocol::ServerNotification;
+    use codex_app_server_protocol::ThreadAttachmentOperation;
+    use codex_app_server_protocol::ThreadAttachmentUpdatedNotification;
     use codex_app_server_protocol::ThreadSettings;
     use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
     use codex_app_server_protocol::WarningNotification;
@@ -230,6 +257,7 @@ mod tests {
 
     fn test_thread_settings() -> ThreadSettings {
         ThreadSettings {
+            disabled_plugin_ids: Vec::new(),
             cwd: test_path_buf("/tmp/thread-settings").abs(),
             approval_policy: codex_app_server_protocol::AskForApproval::Never,
             approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::User,
@@ -333,6 +361,23 @@ mod tests {
             ServerNotification::ThreadSettingsUpdated(ThreadSettingsUpdatedNotification {
                 thread_id: thread_id.to_string(),
                 thread_settings: test_thread_settings(),
+            });
+
+        let target = server_notification_thread_target(&notification);
+
+        assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
+    }
+
+    #[test]
+    fn thread_attachment_updated_notifications_route_to_threads() {
+        let thread_id = ThreadId::new();
+        let notification =
+            ServerNotification::ThreadAttachmentUpdated(ThreadAttachmentUpdatedNotification {
+                thread_id: thread_id.to_string(),
+                attachment_type: "pull_request".to_string(),
+                identity_key: r#"["github.com","openai","codex",123]"#.to_string(),
+                attachment_id: "attachment-1".to_string(),
+                operation: ThreadAttachmentOperation::Deleted,
             });
 
         let target = server_notification_thread_target(&notification);

@@ -60,14 +60,16 @@ pub(crate) fn select_handlers_for_matcher_inputs(
             | HookEventName::PreCompact
             | HookEventName::PostCompact => {
                 if matcher_inputs.is_empty() {
-                    matches_matcher(handler.matcher.as_deref(), /*input*/ None)
+                    matches_matcher(handler.matcher.as_ref(), /*input*/ None)
                 } else {
                     matcher_inputs
                         .iter()
-                        .any(|input| matches_matcher(handler.matcher.as_deref(), Some(input)))
+                        .any(|input| matches_matcher(handler.matcher.as_ref(), Some(input)))
                 }
             }
-            HookEventName::UserPromptSubmit | HookEventName::Stop => true,
+            HookEventName::UserPromptSubmit | HookEventName::Stop | HookEventName::Interrupt => {
+                true
+            }
         })
         .cloned()
         .collect()
@@ -78,6 +80,7 @@ pub(crate) fn running_summary(handler: &ConfiguredHandler) -> HookRunSummary {
         unreachable!("executor-scoped hooks do not produce public hook summaries");
     };
     HookRunSummary {
+        builtin: handler.builtin,
         id: handler.run_id(),
         event_name: handler.event_name,
         handler_type: handler.handler_type(),
@@ -232,6 +235,7 @@ pub(crate) fn completed_summary(
         unreachable!("executor-scoped hooks do not produce public hook summaries");
     };
     HookRunSummary {
+        builtin: handler.builtin,
         id: handler.run_id(),
         event_name: handler.event_name,
         handler_type: handler.handler_type(),
@@ -261,7 +265,8 @@ pub(crate) fn scope_for_event(event_name: HookEventName) -> HookScope {
         | HookEventName::PostCompact
         | HookEventName::UserPromptSubmit
         | HookEventName::SubagentStop
-        | HookEventName::Stop => HookScope::Turn,
+        | HookEventName::Stop
+        | HookEventName::Interrupt => HookScope::Turn,
     }
 }
 
@@ -278,6 +283,7 @@ pub(crate) fn hook_event_name_label(event_name: HookEventName) -> &'static str {
         HookEventName::SubagentStart => "SubagentStart",
         HookEventName::SubagentStop => "SubagentStop",
         HookEventName::Stop => "Stop",
+        HookEventName::Interrupt => "Interrupt",
     }
 }
 
@@ -344,8 +350,10 @@ mod tests {
         display_order: i64,
     ) -> ConfiguredHandler {
         ConfiguredHandler {
+            builtin: false,
             event_name,
-            matcher: matcher.map(str::to_owned),
+            matcher: matcher
+                .map(|pattern| crate::engine::HookMatcher::new(pattern).expect("valid matcher")),
             timeout_sec: 5,
             status_message: None,
             additional_context_limit: Default::default(),
@@ -378,6 +386,34 @@ mod tests {
         ];
 
         let selected = select_handlers(&handlers, HookEventName::Stop, /*matcher_input*/ None);
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].display_order, 0);
+        assert_eq!(selected[1].display_order, 1);
+    }
+
+    #[test]
+    fn select_handlers_ignores_interrupt_matchers() {
+        let handlers = vec![
+            make_handler(
+                HookEventName::Interrupt,
+                Some("^interrupted$"),
+                "echo first",
+                /*display_order*/ 0,
+            ),
+            make_handler(
+                HookEventName::Interrupt,
+                /*matcher*/ None,
+                "echo second",
+                /*display_order*/ 1,
+            ),
+        ];
+
+        let selected = select_handlers(
+            &handlers,
+            HookEventName::Interrupt,
+            /*matcher_input*/ None,
+        );
 
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].display_order, 0);
@@ -574,7 +610,7 @@ mod tests {
             ),
             make_handler(
                 HookEventName::UserPromptSubmit,
-                Some("["),
+                Some("^unmatched$"),
                 "echo second",
                 /*display_order*/ 1,
             ),

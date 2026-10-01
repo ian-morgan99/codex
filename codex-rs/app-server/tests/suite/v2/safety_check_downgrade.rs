@@ -27,7 +27,7 @@ use tokio::time::timeout;
 use wiremock::ResponseTemplate;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-const REQUESTED_MODEL: &str = "gpt-5.4";
+const REQUESTED_MODEL: &str = "gpt-5.5";
 const SERVER_MODEL: &str = "gpt-5.3-codex";
 const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION: &str = "trusted_access_for_cyber";
 const CYBER_POLICY_MESSAGE: &str =
@@ -137,6 +137,7 @@ async fn cyber_policy_response_emits_typed_error_notification_v2() -> Result<()>
         error,
         ErrorNotification {
             error: codex_app_server_protocol::TurnError {
+                misalignment: None,
                 message: CYBER_POLICY_MESSAGE.to_string(),
                 codex_error_info: Some(CodexErrorInfo::CyberPolicy),
                 additional_details: None,
@@ -486,6 +487,5 @@ fn create_config_toml(codex_home: &std::path::Path, server_uri: &str) -> std::io
     MockResponsesConfig::new(server_uri)
         .with_model(REQUESTED_MODEL)
         .disable_feature(Feature::RemoteModels)
-        .enable_feature(Feature::Personality)
         .write(codex_home)
 }

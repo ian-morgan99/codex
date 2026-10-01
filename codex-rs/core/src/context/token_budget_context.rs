@@ -1,7 +1,9 @@
 use super::ContextualUserFragment;
 use super::world_state::PreviousSectionState;
 use super::world_state::WorldStateSection;
+use crate::context::world_state::SectionTransition;
 use codex_protocol::AgentPath;
+use codex_protocol::models::ContentItemKind;
 use codex_protocol::protocol::CONTEXT_WINDOW_CLOSE_TAG;
 use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG;
 use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_OPEN_TAG;
@@ -14,7 +16,7 @@ pub(crate) struct TokenBudgetContext {
     first_window_id: Uuid,
     previous_window_id: Option<Uuid>,
     window_id: Uuid,
-    mcp_result: Option<String>,
+    thread_hint: Option<String>,
 }
 
 impl TokenBudgetContext {
@@ -23,19 +25,23 @@ impl TokenBudgetContext {
         first_window_id: Uuid,
         previous_window_id: Option<Uuid>,
         window_id: Uuid,
-        mcp_result: Option<String>,
+        thread_hint: Option<String>,
     ) -> Self {
         Self {
             agent_path,
             first_window_id,
             previous_window_id,
             window_id,
-            mcp_result,
+            thread_hint,
         }
     }
 }
 
 impl ContextualUserFragment for TokenBudgetContext {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("token_budget.context_window".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "developer"
     }
@@ -63,8 +69,8 @@ impl ContextualUserFragment for TokenBudgetContext {
         if let Some(previous_window_id) = self.previous_window_id {
             lines.push(format!("Previous context window id: {previous_window_id}"));
         }
-        if let Some(mcp_result) = &self.mcp_result {
-            lines.push(mcp_result.clone());
+        if let Some(thread_hint) = &self.thread_hint {
+            lines.push(thread_hint.clone());
         }
         format!("\n{}\n", lines.join("\n"))
     }
@@ -74,16 +80,14 @@ impl WorldStateSection for TokenBudgetContext {
     const ID: &'static str = "context_window";
     type Snapshot = AgentPath;
 
-    fn snapshot(&self) -> Self::Snapshot {
-        self.agent_path.clone()
-    }
-
     fn render_diff(
         &self,
         previous: PreviousSectionState<'_, Self::Snapshot>,
-    ) -> Option<Box<dyn ContextualUserFragment>> {
-        matches!(previous, PreviousSectionState::Known(agent_path) if agent_path != &self.agent_path)
-            .then(|| Box::new(self.clone()) as Box<dyn ContextualUserFragment>)
+    ) -> SectionTransition<Self::Snapshot> {
+        let current = self.agent_path.clone();
+        let fragment = matches!(previous, PreviousSectionState::Known(agent_path) if agent_path != &self.agent_path)
+            .then(|| Box::new(self.clone()) as Box<dyn ContextualUserFragment>);
+        (Some(current), fragment)
     }
 }
 
@@ -101,6 +105,10 @@ impl ContextWindowGuidance {
 }
 
 impl ContextualUserFragment for ContextWindowGuidance {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("token_budget.context_window_guidance".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "developer"
     }
@@ -139,6 +147,10 @@ impl TokenBudgetRemainingContext {
 }
 
 impl ContextualUserFragment for TokenBudgetRemainingContext {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("token_budget.remaining_tokens".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "developer"
     }
@@ -175,6 +187,10 @@ impl TokenBudgetReminder {
 }
 
 impl ContextualUserFragment for TokenBudgetReminder {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("token_budget.reminder".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "developer"
     }
@@ -206,6 +222,10 @@ impl AutoCompactFallbackPrompt {
 }
 
 impl ContextualUserFragment for AutoCompactFallbackPrompt {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("compaction.auto_fallback_prompt".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "developer"
     }

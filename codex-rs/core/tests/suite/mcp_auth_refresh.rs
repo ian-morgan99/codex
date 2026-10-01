@@ -81,7 +81,7 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
     *bearer_token_env_var = None;
     let mcp_servers = HashMap::from([(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
-        EffectiveMcpServer::configured(hosted_plugin_runtime_config),
+        EffectiveMcpServer::from_host_config(hosted_plugin_runtime_config),
     )]);
     let mut config = ConfigBuilder::default()
         .codex_home(home.path().to_path_buf())
@@ -108,7 +108,7 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
         codex_apps_tools_cache_key: codex_mcp::codex_apps_tools_cache_key(Some(&expected_auth)),
         client_mcp_extensions: ClientMcpExtensions::default(),
         auth: Some(expected_auth.clone()),
-        codex_apps_auth_manager: Some(Arc::clone(&auth_manager)),
+        auth_manager: Some(Arc::clone(&auth_manager)),
         elicitation_reviewer: None,
         elicitation_lifecycle: None,
     })

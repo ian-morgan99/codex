@@ -6,6 +6,8 @@ use crate::events::compact::PostCompactRequest;
 use crate::events::compact::PreCompactOutcome;
 use crate::events::compact::PreCompactRequest;
 use crate::events::compact::StatelessHookOutcome;
+use crate::events::interrupt::InterruptOutcome;
+use crate::events::interrupt::InterruptRequest;
 use crate::events::permission_request::PermissionRequestOutcome;
 use crate::events::permission_request::PermissionRequestRequest;
 use crate::events::post_tool_use::PostToolUseOutcome;
@@ -61,6 +63,8 @@ pub struct Hooks {
     environment: Arc<Vec<(OsString, OsString)>>,
     after_agent: Vec<Hook>,
     engine: ClaudeHooksEngine,
+    plugin_hook_sources: Vec<PluginHookSource>,
+    plugin_hook_load_warnings: Vec<String>,
 }
 
 impl Hooks {
@@ -96,6 +100,15 @@ impl Hooks {
         )
     }
 
+    pub fn matches_plugin_hooks<'a>(
+        &self,
+        sources: impl IntoIterator<Item = &'a PluginHookSource>,
+        warnings: impl IntoIterator<Item = &'a String>,
+    ) -> bool {
+        self.plugin_hook_sources.iter().eq(sources)
+            && self.plugin_hook_load_warnings.iter().eq(warnings)
+    }
+
     pub fn with_executor_hooks(&self, executor_hooks: Vec<ExecutorPluginHookSource>) -> Self {
         let mut hooks = self.clone();
         hooks.engine.set_executor_hooks(executor_hooks);
@@ -122,8 +135,8 @@ impl Hooks {
             config.feature_enabled,
             config.bypass_hook_trust,
             config.config_layer_stack.as_ref(),
-            config.plugin_hook_sources,
-            config.plugin_hook_load_warnings,
+            config.plugin_hook_sources.clone(),
+            config.plugin_hook_load_warnings.clone(),
             command_runtime,
             mcp_executor,
         );
@@ -131,6 +144,8 @@ impl Hooks {
             environment,
             after_agent,
             engine,
+            plugin_hook_sources: config.plugin_hook_sources,
+            plugin_hook_load_warnings: config.plugin_hook_load_warnings,
         }
     }
 
@@ -276,6 +291,14 @@ impl Hooks {
     pub async fn run_session_end(&self, request: SessionEndRequest) -> SessionEndOutcome {
         self.engine.run_session_end(request).await
     }
+
+    pub fn preview_interrupt(&self) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_interrupt()
+    }
+
+    pub async fn run_interrupt(&self, request: InterruptRequest) -> InterruptOutcome {
+        self.engine.run_interrupt(request).await
+    }
 }
 
 pub fn list_hooks(config: HooksConfig) -> HookListOutcome {
@@ -304,7 +327,7 @@ pub(crate) fn command_from_argv(
     if program.is_empty() {
         return None;
     }
-    let mut command = Command::new(program);
+    let mut command = Command::from(codex_utils_process::background_command(program));
     command.args(args);
     command.env_clear();
     command.envs(environment);

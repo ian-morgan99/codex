@@ -19,7 +19,10 @@ async fn sqlite_sink_filters_noisy_targets_without_dropping_useful_diagnostics()
     )
     .await
     .expect("initialize runtime");
-    let layer = start(runtime.clone());
+    let layer = start(
+        runtime.clone(),
+        Arc::new(super::tests::SharedWriter::default()),
+    );
 
     let guard = tracing_subscriber::registry()
         .with(layer.clone().with_filter(default_filter()))
@@ -30,9 +33,27 @@ async fn sqlite_sink_filters_noisy_targets_without_dropping_useful_diagnostics()
     tracing::info!(target: "opentelemetry_sdk", "retained-info");
     tracing::warn!(target: "sqlx::query", "dropped-slow-query-warning");
     tracing::warn!(target: "sqlx::pool::acquire", "dropped-slow-acquire-warning");
-    tracing::warn!(target: "sqlx::other", "retained-sqlx-warning");
+    tracing::warn!(target: "sqlx::other", "dropped-sqlx-warning");
+    tracing::info!(target: "sqlx_application", "retained-unrelated-target");
+    tracing::debug!(target: "opentelemetry-otlp", "dropped-otlp-export");
+    tracing::error!(target: "opentelemetry-http", "dropped-http-export");
+    tracing::trace!(target: "h2::proto::streams", "dropped-http2-trace");
+    tracing::debug!(target: "tonic::transport::channel", "dropped-grpc-transport-debug");
+    tracing::debug!(target: "tower::buffer::worker", "dropped-grpc-buffer-debug");
+    tracing::warn!(
+        target: "h2::proto::ping_pong",
+        "recv PING ack that we never sent: {:?}",
+        "synthetic-ack"
+    );
+    tracing::warn!(target: "h2::proto::ping_pong", "retained-http2-ping-warning");
+    tracing::warn!(target: "h2::proto::streams", "retained-http2-warning");
     tracing::debug!(target: "rmcp::transport", "dropped-rmcp-debug");
     tracing::info!(target: "rmcp::transport", "retained-rmcp-info");
+    tracing::trace!(target: "tokio_graceful::guard", "dropped-guard-trace");
+    tracing::debug!(target: "tokio_graceful::guard", "retained-guard-debug");
+    tracing::trace!(target: "tokio_graceful::trigger", "dropped-trigger-trace");
+    tracing::debug!(target: "tokio_graceful::trigger", "retained-trigger-debug");
+    tracing::trace!(target: "tokio_graceful::shutdown", "retained-shutdown-trace");
     tracing::debug!(
         target: "codex_rmcp_client::oauth",
         "dropped-codex-rmcp-client-debug"
@@ -90,8 +111,33 @@ async fn sqlite_sink_filters_noisy_targets_without_dropping_useful_diagnostics()
             .collect::<Vec<_>>(),
         vec![
             ("INFO", "opentelemetry_sdk", Some("retained-info")),
-            ("WARN", "sqlx::other", Some("retained-sqlx-warning")),
+            (
+                "INFO",
+                "sqlx_application",
+                Some("retained-unrelated-target")
+            ),
+            (
+                "WARN",
+                "h2::proto::ping_pong",
+                Some("retained-http2-ping-warning")
+            ),
+            ("WARN", "h2::proto::streams", Some("retained-http2-warning")),
             ("INFO", "rmcp::transport", Some("retained-rmcp-info")),
+            (
+                "DEBUG",
+                "tokio_graceful::guard",
+                Some("retained-guard-debug")
+            ),
+            (
+                "DEBUG",
+                "tokio_graceful::trigger",
+                Some("retained-trigger-debug")
+            ),
+            (
+                "TRACE",
+                "tokio_graceful::shutdown",
+                Some("retained-shutdown-trace")
+            ),
             (
                 "INFO",
                 "codex_rmcp_client::oauth",

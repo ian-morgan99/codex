@@ -1,20 +1,36 @@
 use super::PreviousSectionState;
+use super::SectionTransition;
 use super::WorldStateSection;
 use crate::context::ContextualUserFragment;
 use crate::context::environment_context::FileSystemContext;
 use crate::context::environment_context::NetworkContext;
 use crate::context::environment_context::push_xml_escaped_text;
 use crate::environment_selection::TurnEnvironmentSnapshot;
+use crate::environment_selection::TurnEnvironmentState;
 use crate::session::turn_context::TurnContext;
+use crate::shell::ShellType;
+use codex_features::Feature;
+use codex_protocol::models::ContentItemKind;
 use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::LazyLock;
+use std::time::Duration;
+use tokio::process::Command;
+use tokio::sync::Mutex;
+
+static POWERSHELL_VERSIONS: LazyLock<Mutex<BTreeMap<PathBuf, Option<String>>>> =
+    LazyLock::new(Mutex::default);
 
 /// Environment values visible to the model.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EnvironmentsState {
     environments: BTreeMap<String, EnvironmentState>,
+    shell_version: Option<String>,
     current_date: Option<String>,
     timezone: Option<String>,
     network: Option<NetworkContext>,
@@ -23,13 +39,26 @@ pub(crate) struct EnvironmentsState {
 }
 
 impl EnvironmentsState {
-    pub(crate) fn from_turn_context_with_environments(
+    pub(crate) async fn from_turn_context_with_environments(
         turn_context: &TurnContext,
         environments: &TurnEnvironmentSnapshot,
         current_date: Option<String>,
     ) -> Self {
+        let shell_version = if turn_context
+            .config
+            .features
+            .enabled(Feature::PowerShellShellVersion)
+            && let Some(environment) = environments.single_local_environment()
+            && let Some(shell) = environment.shell.as_ref()
+            && shell.shell_type == ShellType::PowerShell
+        {
+            powershell_version(&shell.shell_path).await
+        } else {
+            None
+        };
         Self {
             environments: environment_states(environments),
+            shell_version,
             current_date,
             timezone: turn_context.timezone.clone(),
             network: network_from_turn_context(turn_context),
@@ -61,7 +90,10 @@ impl EnvironmentsState {
                 .collect(),
             legacy_single: is_legacy_single(&self.environments),
             include_primary: self.environments.len() > 1,
+            shell_version: self.shell_version.clone(),
+            shell_version_removed: false,
             current_date: self.current_date.clone(),
+            current_date_removed: false,
             timezone: self.timezone.clone(),
             network: self.network.clone(),
             filesystem: self.filesystem.clone(),
@@ -74,8 +106,11 @@ impl WorldStateSection for EnvironmentsState {
     const ID: &'static str = "environments";
     type Snapshot = EnvironmentsSnapshot;
 
-    fn snapshot(&self) -> Self::Snapshot {
-        EnvironmentsSnapshot {
+    fn render_diff(
+        &self,
+        previous: PreviousSectionState<'_, Self::Snapshot>,
+    ) -> SectionTransition<Self::Snapshot> {
+        let current = EnvironmentsSnapshot {
             environments: self
                 .environments
                 .iter()
@@ -85,31 +120,29 @@ impl WorldStateSection for EnvironmentsState {
                         EnvironmentSnapshot {
                             cwd: environment.cwd.inferred_native_path_string(),
                             status: environment.status,
+                            error: environment.error.clone(),
                             shell: environment.shell.clone(),
                             is_primary: self.environments.len() > 1 && environment.is_primary,
                         },
                     )
                 })
                 .collect(),
+            shell_version: self.shell_version.clone(),
             current_date: self.current_date.clone(),
             timezone: self.timezone.clone(),
             network: self.network.as_ref().map(NetworkContext::render),
             filesystem: self.filesystem.as_ref().map(FileSystemContext::render),
             subagents: self.subagents.clone(),
-        }
-    }
-
-    fn render_diff(
-        &self,
-        previous: PreviousSectionState<'_, Self::Snapshot>,
-    ) -> Option<Box<dyn ContextualUserFragment>> {
-        let current = self.snapshot();
+        };
         let empty = EnvironmentsSnapshot::default();
         let previous = match previous {
             PreviousSectionState::Known(previous) => previous,
             PreviousSectionState::Absent | PreviousSectionState::Unknown => &empty,
         };
-        let turn_context_values_changed = current.current_date != previous.current_date
+        let shell_version_added =
+            current.shell_version.is_some() && previous.shell_version.is_none();
+        let turn_context_values_changed = current.shell_version != previous.shell_version
+            || current.current_date != previous.current_date
             || current.timezone != previous.timezone
             || current.network != previous.network
             || current.filesystem != previous.filesystem;
@@ -122,6 +155,7 @@ impl WorldStateSection for EnvironmentsState {
                 let environment = &current.environments[*id];
                 previous.environments.get(*id).is_none_or(|previous| {
                     multiple_environments != previous_multiple_environments
+                        || (shell_version_added && previous.shell.is_none())
                         || !environment.has_same_diff_value(previous)
                 })
             })
@@ -138,22 +172,32 @@ impl WorldStateSection for EnvironmentsState {
             && updates
                 .values()
                 .all(|update| matches!(update, EnvironmentUpdate::Current(_)));
-        (!updates.is_empty() || turn_context_values_changed).then(|| {
+        let fragment = (!updates.is_empty() || turn_context_values_changed).then(|| {
             Box::new(RenderedEnvironments {
                 updates,
                 legacy_single,
                 include_primary: multiple_environments || previous_multiple_environments,
+                shell_version: self.shell_version.clone(),
+                shell_version_removed: self.shell_version.is_none()
+                    && previous.shell_version.is_some(),
                 current_date: self.current_date.clone(),
+                current_date_removed: self.current_date.is_none()
+                    && previous.current_date.is_some(),
                 timezone: self.timezone.clone(),
                 network: self.network.clone(),
                 filesystem: self.filesystem.clone(),
                 subagents: self.subagents.clone(),
             }) as Box<dyn ContextualUserFragment>
-        })
+        });
+        (Some(current), fragment)
     }
 }
 
 impl ContextualUserFragment for EnvironmentsState {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("environments.environment_context".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "user"
     }
@@ -175,7 +219,10 @@ struct RenderedEnvironments {
     updates: BTreeMap<String, EnvironmentUpdate>,
     legacy_single: bool,
     include_primary: bool,
+    shell_version: Option<String>,
+    shell_version_removed: bool,
     current_date: Option<String>,
+    current_date_removed: bool,
     timezone: Option<String>,
     network: Option<NetworkContext>,
     filesystem: Option<FileSystemContext>,
@@ -188,6 +235,10 @@ enum EnvironmentUpdate {
 }
 
 impl ContextualUserFragment for RenderedEnvironments {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("environments.environment_context".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "user"
     }
@@ -234,7 +285,17 @@ impl ContextualUserFragment for RenderedEnvironments {
             }
             rendered.push_str("  </environments>\n");
         }
-        push_optional_element(&mut rendered, "current_date", self.current_date.as_deref());
+        if self.shell_version_removed {
+            rendered.push_str("  <shell_version status=\"unavailable\" />\n");
+        } else {
+            let shell_version = self.shell_version.as_deref();
+            push_optional_element(&mut rendered, "shell_version", shell_version);
+        }
+        if self.current_date_removed {
+            rendered.push_str("  <current_date status=\"unavailable\" />\n");
+        } else {
+            push_optional_element(&mut rendered, "current_date", self.current_date.as_deref());
+        }
         push_optional_element(&mut rendered, "timezone", self.timezone.as_deref());
         if let Some(network) = &self.network {
             rendered.push_str("  ");
@@ -268,6 +329,16 @@ fn push_environment_values(rendered: &mut String, environment: &EnvironmentState
         rendered.push_str(indent);
         rendered.push_str("<status>starting</status>\n");
     }
+    if environment.status == EnvironmentStatus::Failed {
+        rendered.push_str(indent);
+        rendered.push_str("<status>failed</status>\n");
+    }
+    if let Some(error) = &environment.error {
+        rendered.push_str(indent);
+        rendered.push_str("<error>");
+        push_xml_escaped_text(rendered, error);
+        rendered.push_str("</error>\n");
+    }
     if let Some(shell) = &environment.shell {
         rendered.push_str(indent);
         rendered.push_str("<shell>");
@@ -294,12 +365,15 @@ struct EnvironmentState {
     cwd: PathUri,
     status: EnvironmentStatus,
     shell: Option<String>,
+    error: Option<String>,
     is_primary: bool,
 }
 
 #[derive(Default, Deserialize, Serialize)]
 pub(crate) struct EnvironmentsSnapshot {
     environments: BTreeMap<String, EnvironmentSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shell_version: Option<String>,
     current_date: Option<String>,
     timezone: Option<String>,
     network: Option<String>,
@@ -312,6 +386,8 @@ struct EnvironmentSnapshot {
     cwd: String,
     status: EnvironmentStatus,
     shell: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     is_primary: bool,
 }
@@ -320,6 +396,7 @@ impl EnvironmentSnapshot {
     fn has_same_diff_value(&self, other: &Self) -> bool {
         self.cwd == other.cwd
             && self.status == other.status
+            && self.error == other.error
             && self.is_primary == other.is_primary
             && self
                 .shell
@@ -334,6 +411,47 @@ impl EnvironmentSnapshot {
 enum EnvironmentStatus {
     Starting,
     Available,
+    Failed,
+}
+
+async fn powershell_version(shell_path: &Path) -> Option<String> {
+    if let Some(version) = {
+        let versions = POWERSHELL_VERSIONS.lock().await;
+        versions.get(shell_path).cloned()
+    } {
+        return version;
+    }
+
+    let mut command = Command::new(shell_path);
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$PSVersionTable.PSVersion.ToString()",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+
+    let version = tokio::time::timeout(Duration::from_secs(2), command.output())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .filter(|output| output.status.success() && output.stdout.len() <= 64)
+        .and_then(|output| {
+            let mut components = std::str::from_utf8(&output.stdout).ok()?.trim().split('.');
+            let major = components.next()?.parse::<u16>().ok()?;
+            let minor = components.next()?.parse::<u16>().ok()?;
+            Some(format!("{major}.{minor}"))
+        });
+    POWERSHELL_VERSIONS
+        .lock()
+        .await
+        .insert(shell_path.to_owned(), version.clone());
+    version
 }
 
 fn environment_states(snapshot: &TurnEnvironmentSnapshot) -> BTreeMap<String, EnvironmentState> {
@@ -346,6 +464,7 @@ fn environment_states(snapshot: &TurnEnvironmentSnapshot) -> BTreeMap<String, En
                 EnvironmentState {
                     cwd: environment.cwd().clone(),
                     status: EnvironmentStatus::Available,
+                    error: None,
                     shell: environment
                         .shell
                         .as_ref()
@@ -361,9 +480,32 @@ fn environment_states(snapshot: &TurnEnvironmentSnapshot) -> BTreeMap<String, En
             .or_insert_with(|| EnvironmentState {
                 cwd: environment.selection.cwd.clone(),
                 status: EnvironmentStatus::Starting,
+                error: None,
                 shell: None,
                 is_primary: false,
             });
+    }
+    // Bound the additional model context even when many selected environments fail.
+    const MAX_ERROR_BYTES: usize = 256;
+    const MAX_TOTAL_ERROR_BYTES: usize = 512;
+    let mut remaining_error_bytes = MAX_TOTAL_ERROR_BYTES;
+    for environment in &snapshot.environments {
+        if let TurnEnvironmentState::Failed { selection, error } = environment {
+            let detail = error
+                [..error.floor_char_boundary(remaining_error_bytes.min(MAX_ERROR_BYTES))]
+                .to_string();
+            remaining_error_bytes -= detail.len();
+            environments.insert(
+                selection.environment_id.clone(),
+                EnvironmentState {
+                    cwd: selection.cwd.clone(),
+                    status: EnvironmentStatus::Failed,
+                    shell: None,
+                    error: (!detail.is_empty()).then_some(detail),
+                    is_primary: false,
+                },
+            );
+        }
     }
     environments
 }

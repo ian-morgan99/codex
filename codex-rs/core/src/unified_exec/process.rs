@@ -34,6 +34,7 @@ use super::UNIFIED_EXEC_OUTPUT_MAX_TOKENS;
 use super::UnifiedExecError;
 use super::head_tail_buffer::HeadTailBuffer;
 use super::process_state::ProcessState;
+use crate::shell_snapshot::ShellSnapshotFile;
 
 const EARLY_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
 pub(crate) trait SpawnLifecycle: std::fmt::Debug + Send + Sync {
@@ -57,10 +58,25 @@ pub(crate) struct NoopSpawnLifecycle;
 
 impl SpawnLifecycle for NoopSpawnLifecycle {}
 
+/// Output pending model polling and the retained completion transcript.
+/// Append both under the same lock so cancellation cannot split an update.
+#[derive(Default)]
+pub(crate) struct OutputBuffers<const MAX_BYTES: usize = UNIFIED_EXEC_OUTPUT_MAX_BYTES> {
+    pub(super) pending: HeadTailBuffer<MAX_BYTES>,
+    pub(super) transcript: HeadTailBuffer<MAX_BYTES>,
+}
+
+impl<const MAX_BYTES: usize> OutputBuffers<MAX_BYTES> {
+    pub(super) fn push_chunk(&mut self, chunk: &[u8]) {
+        self.pending.push_chunk(chunk);
+        self.transcript.push_chunk(chunk);
+    }
+}
+
 /// Shared output state exposed to polling and streaming consumers.
 #[derive(Clone)]
 pub(crate) struct OutputHandles<const MAX_BYTES: usize = UNIFIED_EXEC_OUTPUT_MAX_BYTES> {
-    pub(crate) output_buffer: Arc<Mutex<HeadTailBuffer<MAX_BYTES>>>,
+    pub(crate) output_buffer: Arc<Mutex<OutputBuffers<MAX_BYTES>>>,
     pub(crate) output_notify: Arc<Notify>,
     pub(crate) output_closed: Arc<AtomicBool>,
     pub(crate) output_closed_notify: Arc<Notify>,
@@ -96,8 +112,11 @@ pub(crate) struct UnifiedExecProcess {
     state_tx: watch::Sender<ProcessState>,
     state_rx: watch::Receiver<ProcessState>,
     output_task: Option<JoinHandle<()>>,
-    sandbox_type: SandboxType,
+    sandbox_type: Option<SandboxType>,
+    timed_out: AtomicBool,
     _spawn_lifecycle: Option<SpawnLifecycleHandle>,
+    // The shell may still need to replay this file after process startup returns.
+    pub(crate) _shell_snapshot: Option<Arc<ShellSnapshotFile>>,
 }
 
 impl std::fmt::Debug for UnifiedExecProcess {
@@ -113,11 +132,11 @@ impl std::fmt::Debug for UnifiedExecProcess {
 impl UnifiedExecProcess {
     fn new(
         process_handle: ProcessHandle,
-        sandbox_type: SandboxType,
+        sandbox_type: Option<SandboxType>,
         spawn_lifecycle: Option<SpawnLifecycleHandle>,
     ) -> Self {
         let output = OutputHandles {
-            output_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
+            output_buffer: Arc::new(Mutex::new(OutputBuffers::default())),
             output_notify: Arc::new(Notify::new()),
             output_closed: Arc::new(AtomicBool::new(false)),
             output_closed_notify: Arc::new(Notify::new()),
@@ -137,7 +156,9 @@ impl UnifiedExecProcess {
             state_rx,
             output_task: None,
             sandbox_type,
+            timed_out: AtomicBool::new(false),
             _spawn_lifecycle: spawn_lifecycle,
+            _shell_snapshot: None,
         }
     }
 
@@ -195,6 +216,9 @@ impl UnifiedExecProcess {
     }
 
     pub(super) fn exit_code(&self) -> Option<i32> {
+        if self.timed_out() {
+            return Some(124);
+        }
         let state = self.state_rx.borrow().clone();
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => {
@@ -202,6 +226,14 @@ impl UnifiedExecProcess {
             }
             ProcessHandle::ExecServer(_) => state.exit_code,
         }
+    }
+
+    pub(super) fn mark_timed_out(&self) {
+        self.timed_out.store(true, Ordering::Release);
+    }
+
+    pub(super) fn timed_out(&self) -> bool {
+        self.timed_out.load(Ordering::Acquire)
     }
 
     fn finish_termination(&self) {
@@ -261,10 +293,10 @@ impl UnifiedExecProcess {
 
     async fn snapshot_output(&self) -> Vec<u8> {
         let guard = self.output.output_buffer.lock().await;
-        guard.to_bytes()
+        guard.pending.to_bytes()
     }
 
-    pub(crate) fn sandbox_type(&self) -> SandboxType {
+    pub(crate) fn sandbox_type(&self) -> Option<SandboxType> {
         self.sandbox_type
     }
 
@@ -292,7 +324,7 @@ impl UnifiedExecProcess {
         text: &str,
     ) -> Result<(), UnifiedExecError> {
         let executor_reported_denial = self.state_rx.borrow().sandbox_denied;
-        let sandbox_type = self.sandbox_type();
+        let sandbox_type = self.sandbox_type().unwrap_or(SandboxType::None);
         if !self.has_exited() || (!executor_reported_denial && sandbox_type == SandboxType::None) {
             return Ok(());
         }
@@ -337,7 +369,7 @@ impl UnifiedExecProcess {
         let output_rx = codex_utils_pty::combine_output_receivers(stdout_rx, stderr_rx);
         let mut managed = Self::new(
             ProcessHandle::Local(Box::new(process_handle)),
-            sandbox_type,
+            Some(sandbox_type),
             Some(spawn_lifecycle),
         );
         managed.output_task = Some(Self::spawn_local_output_task(
@@ -386,7 +418,7 @@ impl UnifiedExecProcess {
         let process_handle = ProcessHandle::ExecServer(Arc::clone(&started.process));
         // Older peers do not report this field. In that case, skip local
         // classification rather than attributing a violation to a guessed backend.
-        let sandbox_type = started.sandbox_type.unwrap_or(SandboxType::None);
+        let sandbox_type = started.sandbox_type;
         let mut managed = Self::new(process_handle, sandbox_type, /*spawn_lifecycle*/ None);
         let output_handles = managed.output_handles().clone();
         managed.output_task = Some(Self::spawn_exec_server_output_task(

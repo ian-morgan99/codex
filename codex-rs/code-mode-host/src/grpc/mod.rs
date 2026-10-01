@@ -9,11 +9,13 @@ mod waits;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::WaitRequest;
 use codex_code_mode_protocol::grpc as proto;
 use codex_code_mode_protocol::grpc::code_mode_host_server::CodeModeHost;
+use codex_protocol::protocol::W3cTraceContext;
 use futures::Stream;
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -21,6 +23,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
+use tracing::Instrument;
 
 use self::session::GrpcHostState;
 use self::session::GrpcSession;
@@ -28,6 +31,17 @@ use self::waits::WaitRegistration;
 
 type GrpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 type GrpcFuture<'a, T> = Pin<Box<dyn Future<Output = Result<Response<T>, Status>> + Send + 'a>>;
+
+fn trace_context_from_request<T>(request: &Request<T>) -> Option<W3cTraceContext> {
+    request
+        .metadata()
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+        .map(|traceparent| W3cTraceContext {
+            traceparent: Some(traceparent.to_string()),
+            tracestate: None,
+        })
+}
 
 /// Serves transport-independent, leased code-mode sessions over gRPC.
 #[derive(Clone)]
@@ -52,6 +66,15 @@ impl GrpcCodeModeHost {
         Ok(Response::new(self.state.open_session(limits)?))
     }
 
+    #[tracing::instrument(
+        name = "code_mode_host.grpc.close_session",
+        level = "info",
+        skip_all,
+        fields(
+            otel.name = "code_mode_host.grpc.close_session",
+            session.id = %request.session_id,
+        )
+    )]
     async fn close_session_request(
         &self,
         request: proto::CloseSessionRequest,
@@ -107,14 +130,16 @@ impl GrpcCodeModeHost {
     async fn execute_request(
         &self,
         request: proto::ExecuteRequest,
+        callback_traceparent: Option<String>,
     ) -> Result<Response<GrpcStream<proto::ExecuteEvent>>, Status> {
+        let received_at = Instant::now();
         let session = self.state.session(&request.session_id)?;
         validation::identifier(&request.execution_id, "execution ID")?;
         let request_permit = self.state.request_permit()?;
         let execution_id = request.execution_id.clone();
         let request = conversions::execute_request(request)?;
         let cell_permit = self.state.cell_permit()?;
-        session.reserve_execution(&execution_id)?;
+        let yield_signal = session.reserve_execution(&execution_id)?;
         let mut admission = ExecutionAdmission {
             session: Arc::clone(&session),
             execution_id: Some(execution_id.clone()),
@@ -123,12 +148,17 @@ impl GrpcCodeModeHost {
             _ = session.closed.cancelled() => {
                 return Err(Status::cancelled("code-mode session is closed"));
             }
-            result = session.runtime.execute(request) => {
+            result = session.runtime.execute(request, Arc::new(delegate::GrpcDelegate::new(Arc::downgrade(&session))), Some(yield_signal)) => {
                 result.map_err(Status::failed_precondition)?
             }
         };
         let cell_id = started.cell_id.clone();
-        session.admit_execution(execution_id.clone(), cell_id.to_string(), cell_permit)?;
+        session.admit_execution(
+            execution_id.clone(),
+            cell_id.to_string(),
+            cell_permit,
+            callback_traceparent,
+        )?;
 
         let (sender, receiver) = mpsc::channel(/*buffer*/ 2);
         sender
@@ -141,22 +171,31 @@ impl GrpcCodeModeHost {
                 )),
             }))
             .map_err(|_| Status::internal("failed to publish code-mode execution admission"))?;
-        tokio::spawn(async move {
-            let _request_permit = request_permit;
-            tokio::select! {
-                biased;
-                _ = sender.closed() => {}
-                response = started.initial_response() => {
-                    let event = response.map(|response| proto::ExecuteEvent {
-                        event: Some(proto::execute_event::Event::Outcome(
-                            conversions::execution_outcome(response),
-                        )),
-                    }).map_err(Status::internal);
-                    let _ = sender.send(event).await;
+        let outcome_span = tracing::Span::current();
+        tokio::spawn(
+            async move {
+                let _request_permit = request_permit;
+                tokio::select! {
+                    biased;
+                    _ = sender.closed() => {}
+                    response = started.initial_response() => {
+                        // Freeze timing before conversion or transport backpressure.
+                        let code_mode_host_duration = received_at.elapsed();
+                        let event = response.and_then(|response| {
+                            let response = response.with_code_mode_host_duration(code_mode_host_duration);
+                            let outcome = conversions::execution_outcome(response)
+                                .map_err(|error| error.to_string())?;
+                            Ok(proto::ExecuteEvent {
+                                event: Some(proto::execute_event::Event::Outcome(outcome)),
+                            })
+                        }).map_err(Status::internal);
+                        let _ = sender.send(event).await;
+                    }
+                    _ = session.closed.cancelled() => {}
                 }
-                _ = session.closed.cancelled() => {}
             }
-        });
+            .instrument(outcome_span),
+        );
 
         let stream = ReceiverStream::new(receiver).inspect(move |event| {
             if matches!(
@@ -171,10 +210,22 @@ impl GrpcCodeModeHost {
         Ok(Response::new(Box::pin(stream)))
     }
 
+    #[tracing::instrument(
+        name = "code_mode_host.grpc.wait",
+        level = "info",
+        skip_all,
+        fields(
+            otel.name = "code_mode_host.grpc.wait",
+            session.id = %request.session_id,
+            cell.id = %request.cell_id,
+            wait.id = %request.wait_id,
+        )
+    )]
     async fn wait_request(
         &self,
         request: proto::WaitRequest,
     ) -> Result<Response<proto::WaitResponse>, Status> {
+        let received_at = Instant::now();
         let session = self.state.session(&request.session_id)?;
         validation::identifier(&request.cell_id, "cell ID")?;
         validation::identifier(&request.wait_id, "wait ID")?;
@@ -192,11 +243,14 @@ impl GrpcCodeModeHost {
             _ = session.closed.cancelled() => {
                 return Err(Status::cancelled("code-mode session is closed"));
             }
-            outcome = session.runtime.wait(request) => {
+            outcome = session.runtime.wait(request, Some(registration.yield_signal())) => {
                 outcome.map_err(Status::failed_precondition)?
             }
         };
-        Ok(Response::new(conversions::wait_response(outcome)))
+        let outcome = outcome.with_code_mode_host_duration(received_at.elapsed());
+        let response = conversions::wait_response(outcome)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(response))
     }
 
     async fn cancel_wait_request(
@@ -210,15 +264,37 @@ impl GrpcCodeModeHost {
         Ok(Response::new(proto::CancelWaitResponse {}))
     }
 
+    async fn yield_observation_request(
+        &self,
+        request: proto::YieldObservationRequest,
+    ) -> Result<Response<proto::YieldObservationResponse>, Status> {
+        let _permit = self.state.control_permit()?;
+        let session = self.state.session(&request.session_id)?;
+        match request.observation {
+            Some(proto::yield_observation_request::Observation::ExecutionId(id)) => {
+                session.yield_execution(&id)?;
+            }
+            Some(proto::yield_observation_request::Observation::WaitId(id)) => {
+                session.yield_wait(&id)?;
+            }
+            None => return Err(Status::invalid_argument("missing code-mode observation ID")),
+        }
+        Ok(Response::new(proto::YieldObservationResponse {}))
+    }
+
     async fn terminate_request(
         &self,
         request: proto::TerminateRequest,
     ) -> Result<Response<proto::WaitResponse>, Status> {
+        let received_at = Instant::now();
         let session = self.state.session(&request.session_id)?;
         validation::identifier(&request.cell_id, "cell ID")?;
         let _permit = self.state.request_permit()?;
-        let result = session.terminate(CellId::new(request.cell_id)).await?;
-        Ok(Response::new(conversions::wait_response(result)))
+        let outcome = session.terminate(CellId::new(request.cell_id)).await?;
+        let outcome = outcome.with_code_mode_host_duration(received_at.elapsed());
+        let response = conversions::wait_response(outcome)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(response))
     }
 }
 
@@ -241,7 +317,16 @@ impl CodeModeHost for GrpcCodeModeHost {
         'a: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(self.open_session_request(request.into_inner()))
+        let trace = trace_context_from_request(&request);
+        let request = request.into_inner();
+        let open_session_span = tracing::info_span!("code_mode_host.grpc.open_session");
+        if let Some(trace) = trace.as_ref() {
+            codex_otel::set_parent_from_w3c_trace_context(&open_session_span, trace);
+        }
+        Box::pin(
+            self.open_session_request(request)
+                .instrument(open_session_span),
+        )
     }
 
     fn close_session<'a, 'async_trait>(
@@ -296,7 +381,24 @@ impl CodeModeHost for GrpcCodeModeHost {
         'a: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(self.execute_request(request.into_inner()))
+        let trace = trace_context_from_request(&request);
+        let request = request.into_inner();
+        let execute_span = tracing::info_span!(
+            "code_mode_host.grpc.execute",
+            otel.name = "code_mode_host.grpc.execute",
+            session.id = %request.session_id,
+            execution.id = %request.execution_id,
+            call_id = %request.tool_call_id,
+        );
+        if let Some(trace) = trace.as_ref() {
+            codex_otel::set_parent_from_w3c_trace_context(&execute_span, trace);
+        }
+        let callback_traceparent =
+            codex_otel::span_w3c_trace_context(&execute_span).and_then(|trace| trace.traceparent);
+        Box::pin(
+            self.execute_request(request, callback_traceparent)
+                .instrument(execute_span),
+        )
     }
 
     fn wait<'a, 'async_trait>(
@@ -321,6 +423,17 @@ impl CodeModeHost for GrpcCodeModeHost {
         Box::pin(self.cancel_wait_request(request.into_inner()))
     }
 
+    fn yield_observation<'a, 'async_trait>(
+        &'a self,
+        request: Request<proto::YieldObservationRequest>,
+    ) -> GrpcFuture<'async_trait, proto::YieldObservationResponse>
+    where
+        'a: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(self.yield_observation_request(request.into_inner()))
+    }
+
     fn terminate<'a, 'async_trait>(
         &'a self,
         request: Request<proto::TerminateRequest>,
@@ -340,7 +453,9 @@ struct ExecutionAdmission {
 
 impl ExecutionAdmission {
     fn disarm(&mut self) {
-        self.execution_id = None;
+        if let Some(execution_id) = self.execution_id.take() {
+            self.session.retire_execution_observation(&execution_id);
+        }
     }
 }
 

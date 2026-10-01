@@ -4,6 +4,7 @@
 //! from the user. It decides whether the request can be automatically accepted,
 //! must be declined by policy, or should be surfaced as a Codex protocol event
 //! and later resolved through the stored responder.
+//! Explicit MCP elicitation requests can be surfaced by root and non-root agents.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use crate::McpConfig;
 use crate::mcp::McpPermissionPromptAutoApproveContext;
 use crate::mcp::mcp_permission_prompt_is_auto_approved;
 use anyhow::Context;
@@ -20,12 +22,13 @@ use anyhow::anyhow;
 use async_channel::Sender;
 use codex_protocol::approvals::ElicitationRequest;
 use codex_protocol::approvals::ElicitationRequestEvent;
+use codex_protocol::mcp::ClientMcpExtensions;
+use codex_protocol::mcp::OPENAI_ELICITATION_EXTENSION_ID;
 use codex_protocol::mcp::RequestId as ProtocolRequestId;
 use codex_protocol::mcp_approval_meta::APPROVAL_KIND_KEY;
 use codex_protocol::mcp_approval_meta::APPROVAL_KIND_TOOL_SUGGESTION;
 use codex_protocol::mcp_approval_meta::APPROVALS_REVIEWER_KEY;
 use codex_protocol::mcp_approval_meta::STRICT_AUTO_REVIEW_KEY;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -42,6 +45,9 @@ use tokio::sync::oneshot;
 static NEXT_ELICITATION_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
 
 const STRICT_AUTO_REVIEW_DECLINE_MESSAGE: &str = "Automated review of this operation failed. Do not proceed without asking the user for explicit approval.";
+
+#[path = "user_verification_elicitation.rs"]
+mod user_verification_elicitation;
 
 #[derive(Debug, Clone)]
 pub struct ElicitationReviewRequest {
@@ -147,59 +153,116 @@ impl ElicitationRequestRouter {
             .ok_or_else(|| anyhow!("elicitation request not found"))?;
         responder
             .send(response)
-            .map_err(|e| anyhow!("failed to send elicitation response: {e:?}"))
+            .map_err(|_| anyhow!("elicitation response receiver closed"))
+    }
+
+    async fn request_user_interaction(
+        &self,
+        events: Option<Sender<Event>>,
+        authority: &ElicitationAuthority,
+        server_name: String,
+        request: ElicitationRequest,
+    ) -> Result<ElicitationResponse> {
+        let Some(events) = events else {
+            return Ok(ElicitationResponse {
+                action: ElicitationAction::Decline,
+                content: None,
+                meta: None,
+            });
+        };
+        let (delivery_context, response_context) =
+            if matches!(&request, ElicitationRequest::UserVerification { .. }) {
+                (
+                    "failed to deliver user-verification request",
+                    "user-verification response channel closed",
+                )
+            } else {
+                (
+                    "failed to deliver MCP elicitation request",
+                    "elicitation request channel closed unexpectedly",
+                )
+            };
+        let public_request_id = format!(
+            "codex-mcp-elicitation-{}",
+            NEXT_ELICITATION_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let request_key = (
+            server_name.clone(),
+            RequestId::String(public_request_id.clone().into()),
+        );
+        let (tx, rx) = oneshot::channel();
+        let _active_elicitation = authority
+            .lifecycle
+            .as_ref()
+            .map(ElicitationLifecycle::start);
+        self.requests
+            .lock()
+            .map_err(|_| anyhow!("elicitation request router unavailable"))?
+            .insert(request_key.clone(), tx);
+        let _pending_request = PendingElicitationRequest {
+            router: self.clone(),
+            key: request_key,
+        };
+        events
+            .send(Event {
+                id: "mcp_elicitation_request".to_string(),
+                msg: EventMsg::ElicitationRequest(ElicitationRequestEvent {
+                    turn_id: None,
+                    server_name,
+                    id: ProtocolRequestId::String(public_request_id),
+                    request,
+                }),
+            })
+            .await
+            .context(delivery_context)?;
+        rx.await.context(response_context)
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct ElicitationAuthority {
-    pub(crate) approval_policy: AskForApproval,
-    pub(crate) permission_profile: PermissionProfile,
+    pub(crate) config: Arc<McpConfig>,
     reviewer: Option<ElicitationReviewerHandle>,
     lifecycle: Option<ElicitationLifecycle>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct ElicitationRequestManager {
     router: ElicitationRequestRouter,
-    pub(crate) authority: Arc<StdMutex<ElicitationAuthority>>,
+    pub(crate) authority: Arc<StdMutex<Option<ElicitationAuthority>>>,
 }
 
 impl ElicitationRequestManager {
     pub(crate) fn new(
-        approval_policy: AskForApproval,
-        permission_profile: PermissionProfile,
+        config: Arc<McpConfig>,
         reviewer: Option<ElicitationReviewerHandle>,
         lifecycle: Option<ElicitationLifecycle>,
         router: ElicitationRequestRouter,
     ) -> Self {
         Self {
             router,
-            authority: Arc::new(StdMutex::new(ElicitationAuthority {
-                approval_policy,
-                permission_profile,
+            authority: Arc::new(StdMutex::new(Some(ElicitationAuthority {
+                config,
                 reviewer,
                 lifecycle,
-            })),
+            }))),
         }
     }
 
     pub(crate) fn update(
         &self,
-        approval_policy: AskForApproval,
-        permission_profile: PermissionProfile,
+        config: Arc<McpConfig>,
         reviewer: Option<ElicitationReviewerHandle>,
         lifecycle: Option<ElicitationLifecycle>,
     ) -> bool {
         let Ok(mut authority) = self.authority.lock() else {
             return false;
         };
-        *authority = ElicitationAuthority {
-            approval_policy,
-            permission_profile,
+        *authority = Some(ElicitationAuthority {
+            config,
             reviewer,
             lifecycle,
-        };
+        });
         true
     }
 
@@ -207,7 +270,14 @@ impl ElicitationRequestManager {
         &self,
         server_name: String,
         tx_event: Option<Sender<Event>>,
+        client_mcp_extensions: &ClientMcpExtensions,
     ) -> SendElicitation {
+        // Event receivers such as codex mcp-server do not necessarily handle verification.
+        // Only wait for a response when trusted host activation enabled this exact route.
+        let user_verification_enabled = client_mcp_extensions
+            .get(OPENAI_ELICITATION_EXTENSION_ID)
+            .and_then(|settings| settings.get("userVerification"))
+            .is_some_and(Value::is_object);
         let router = self.router.clone();
         let authority = self.authority.clone();
         Box::new(move |id, elicitation| {
@@ -216,6 +286,38 @@ impl ElicitationRequestManager {
             let server_name = server_name.clone();
             let authority = authority.clone();
             async move {
+                let authority = authority
+                    .lock()
+                    .ok()
+                    .and_then(|authority| authority.clone());
+                if let Elicitation::UserVerification {
+                    meta,
+                    title,
+                    description,
+                    challenge,
+                } = elicitation
+                {
+                    if !user_verification_enabled {
+                        return Ok(ElicitationResponse {
+                            action: ElicitationAction::Cancel,
+                            content: None,
+                            meta: None,
+                        });
+                    }
+                    return user_verification_elicitation::route(
+                        router,
+                        tx_event,
+                        authority,
+                        server_name,
+                        ElicitationRequest::UserVerification {
+                            meta,
+                            title,
+                            description,
+                            challenge,
+                        },
+                    )
+                    .await;
+                }
                 if router.auto_deny() {
                     return Ok(ElicitationResponse {
                         action: ElicitationAction::Decline,
@@ -237,7 +339,7 @@ impl ElicitationRequestManager {
                     });
                 }
 
-                let Ok(authority) = authority.lock().map(|authority| authority.clone()) else {
+                let Some(authority) = authority else {
                     return Ok(ElicitationResponse {
                         action: ElicitationAction::Decline,
                         content: None,
@@ -245,11 +347,20 @@ impl ElicitationRequestManager {
                     });
                 };
                 let ElicitationAuthority {
-                    approval_policy,
-                    permission_profile,
+                    config,
                     reviewer,
                     lifecycle,
-                } = authority;
+                    ..
+                } = &authority;
+                let approval_policy = config.approval_policy.value();
+                let Some(permission_profile) = config.permission_profile_for_server(&server_name)
+                else {
+                    return Ok(ElicitationResponse {
+                        action: ElicitationAction::Decline,
+                        content: None,
+                        meta: None,
+                    });
+                };
 
                 match elicitation
                     .meta()
@@ -303,7 +414,7 @@ impl ElicitationRequestManager {
 
                 let permission_prompt_is_auto_approved = mcp_permission_prompt_is_auto_approved(
                     approval_policy,
-                    &permission_profile,
+                    permission_profile,
                     McpPermissionPromptAutoApproveContext::default(),
                 );
                 if permission_prompt_is_auto_approved && can_auto_accept_elicitation(&elicitation) {
@@ -316,19 +427,26 @@ impl ElicitationRequestManager {
 
                 let should_surface_form_in_full_access = router.full_access_form_input_enabled()
                     && permission_prompt_is_auto_approved
-                    && matches!(
-                        &elicitation,
+                    && !elicitation
+                        .meta()
+                        .is_some_and(|meta| meta.contains_key(APPROVAL_KIND_KEY))
+                    && match &elicitation {
                         Elicitation::Mcp(
                             rmcp::model::ElicitRequestParams::FormElicitationParams {
-                                meta,
                                 requested_schema,
                                 ..
-                            }
-                        ) if !requested_schema.properties.is_empty()
-                            && !meta
-                                .as_ref()
-                                .is_some_and(|meta| meta.contains_key(APPROVAL_KIND_KEY))
-                    );
+                            },
+                        ) => !requested_schema.properties.is_empty(),
+                        Elicitation::OpenAiElicitationForm {
+                            requested_schema, ..
+                        } => requested_schema
+                            .get("properties")
+                            .and_then(Value::as_object)
+                            .is_some_and(|properties| !properties.is_empty()),
+                        Elicitation::Mcp(_)
+                        | Elicitation::OpenAiForm { .. }
+                        | Elicitation::UserVerification { .. } => false,
+                    };
 
                 if !should_surface_form_in_full_access {
                     if elicitation_is_rejected_by_policy(approval_policy) {
@@ -351,20 +469,14 @@ impl ElicitationRequestManager {
                     }
                 }
 
-                let Some(tx_event) = tx_event else {
-                    return Ok(ElicitationResponse {
-                        action: ElicitationAction::Decline,
-                        content: None,
-                        meta: None,
-                    });
-                };
-
-                let public_request_id = format!(
-                    "codex-mcp-elicitation-{}",
-                    NEXT_ELICITATION_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
-                );
-                let routed_request_id = RequestId::String(public_request_id.clone().into());
                 let request = match elicitation {
+                    Elicitation::UserVerification { .. } => {
+                        return Ok(ElicitationResponse {
+                            action: ElicitationAction::Cancel,
+                            content: None,
+                            meta: None,
+                        });
+                    }
                     Elicitation::Mcp(rmcp::model::ElicitRequestParams::FormElicitationParams {
                         meta,
                         message,
@@ -408,33 +520,19 @@ impl ElicitationRequestManager {
                         message,
                         requested_schema,
                     },
+                    Elicitation::OpenAiElicitationForm {
+                        meta,
+                        message,
+                        requested_schema,
+                    } => ElicitationRequest::OpenAiElicitationForm {
+                        meta,
+                        message,
+                        requested_schema,
+                    },
                 };
-                let (tx, rx) = oneshot::channel();
-                let _active_elicitation = lifecycle.as_ref().map(ElicitationLifecycle::start);
-                let request_key = (server_name.clone(), routed_request_id);
                 router
-                    .requests
-                    .lock()
-                    .map_err(|_| anyhow!("elicitation request router unavailable"))?
-                    .insert(request_key.clone(), tx);
-                let _pending_request = PendingElicitationRequest {
-                    router: router.clone(),
-                    key: request_key,
-                };
-                tx_event
-                    .send(Event {
-                        id: "mcp_elicitation_request".to_string(),
-                        msg: EventMsg::ElicitationRequest(ElicitationRequestEvent {
-                            turn_id: None,
-                            server_name,
-                            id: ProtocolRequestId::String(public_request_id),
-                            request,
-                        }),
-                    })
+                    .request_user_interaction(tx_event, &authority, server_name, request)
                     .await
-                    .context("failed to deliver MCP elicitation request")?;
-                rx.await
-                    .context("elicitation request channel closed unexpectedly")
             }
             .boxed()
         })
@@ -471,7 +569,10 @@ fn can_auto_accept_elicitation(elicitation: &Elicitation) -> bool {
             // Auto-accept confirm/approval elicitations without schema requirements.
             requested_schema.properties.is_empty()
         }
-        Elicitation::Mcp(_) | Elicitation::OpenAiForm { .. } => false,
+        Elicitation::Mcp(_)
+        | Elicitation::OpenAiForm { .. }
+        | Elicitation::OpenAiElicitationForm { .. }
+        | Elicitation::UserVerification { .. } => false,
     }
 }
 

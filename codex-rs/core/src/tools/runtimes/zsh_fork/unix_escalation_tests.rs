@@ -10,6 +10,7 @@ use crate::config::Constrained;
 use crate::guardian::GuardianReviewContext;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::tests::make_session_and_context;
+use crate::tools::runtimes::tests::test_credential_broker_network_proxy;
 use anyhow::Context;
 use codex_execpolicy::Decision;
 use codex_execpolicy::Evaluation;
@@ -355,13 +356,15 @@ fn shell_request_escalation_execution_is_explicit() {
 #[tokio::test]
 async fn unsandboxed_intercepted_exec_strips_managed_network_env() -> anyhow::Result<()> {
     let workdir = test_sandbox_cwd();
+    let network = test_credential_broker_network_proxy().await?;
     let executor = CoreShellCommandExecutor {
+        sandbox_manager: codex_sandboxing::SandboxManager::new(),
         command: Vec::new(),
         cwd: workdir.clone(),
         permission_profile: PermissionProfile::workspace_write(),
         sandbox: SandboxType::None,
         env: HashMap::new(),
-        network: None,
+        network: Some(network.clone()),
         network_environment_id: None,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
         arg0: None,
@@ -371,15 +374,24 @@ async fn unsandboxed_intercepted_exec_strips_managed_network_env() -> anyhow::Re
         use_legacy_landlock: false,
     };
     let mut env = HashMap::new();
+    env.insert("GH_TOKEN".to_string(), "ghp-real".to_string());
     env.insert(PROXY_ACTIVE_ENV_KEY.to_string(), "1".to_string());
     for key in PROXY_ENV_KEYS {
         env.insert((*key).to_string(), format!("proxy-{key}"));
     }
+    network.apply_to_env(&mut env);
+    assert_ne!(env.get("GH_TOKEN").map(String::as_str), Some("ghp-real"));
+    let dummy = env.get("GH_TOKEN").expect("brokered token").clone();
 
     let prepared = executor
         .prepare_escalated_exec(
             &AbsolutePathBuf::from_absolute_path("/usr/bin/curl")?,
-            &["curl".to_string(), "example.com".to_string()],
+            &[
+                "curl".to_string(),
+                "-H".to_string(),
+                format!("Authorization: Bearer {dummy}"),
+                "example.com".to_string(),
+            ],
             &workdir,
             env,
             EscalationExecution::Unsandboxed,
@@ -396,6 +408,19 @@ async fn unsandboxed_intercepted_exec_strips_managed_network_env() -> anyhow::Re
             "unsandboxed intercepted exec should strip managed-network proxy env var {key}"
         );
     }
+    assert_eq!(
+        prepared.env.get("GH_TOKEN").map(String::as_str),
+        Some("ghp-real")
+    );
+    assert_eq!(
+        prepared.command,
+        vec![
+            "/usr/bin/curl".to_string(),
+            "-H".to_string(),
+            format!("Authorization: Bearer {dummy}"),
+            "example.com".to_string(),
+        ]
+    );
 
     Ok(())
 }
@@ -467,26 +492,15 @@ async fn execve_permission_request_hook_short_circuits_prompt() -> anyhow::Resul
         .config
         .codex_home
         .join("permission_request_hook_log.jsonl");
-    std::fs::write(
+    codex_utils_cargo_bin::write_executable(
         &script_path,
-        format!(
+        &format!(
             "#!/bin/sh\ncat > {log_path}\nprintf '%s\\n' '{response}'\n",
             log_path = shlex::try_quote(log_path.to_string_lossy().as_ref())?,
             response = "{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionRequest\",\"decision\":{\"behavior\":\"allow\"}}}",
         ),
     )
     .with_context(|| format!("write hook script to {}", script_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut permissions = std::fs::metadata(&script_path)
-            .with_context(|| format!("read hook script metadata from {}", script_path.display()))?
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script_path, permissions)
-            .with_context(|| format!("set hook script permissions on {}", script_path.display()))?;
-    }
     std::fs::write(
         turn_context.config.codex_home.join("hooks.json"),
         serde_json::json!({

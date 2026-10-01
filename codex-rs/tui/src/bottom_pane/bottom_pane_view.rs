@@ -56,6 +56,15 @@ pub(crate) trait BottomPaneView: Renderable {
         None
     }
 
+    /// Apply a matching background suggestion when this view supports text prefills.
+    fn apply_text_suggestion(
+        &mut self,
+        _request_id: uuid::Uuid,
+        _suggestion: Option<&str>,
+    ) -> bool {
+        false
+    }
+
     /// Active tab id for tabbed list-based views.
     #[allow(dead_code)]
     fn active_tab_id(&self) -> Option<&str> {
@@ -133,6 +142,11 @@ pub(crate) trait BottomPaneView: Renderable {
         request: McpServerElicitationFormRequest,
     ) -> Option<McpServerElicitationFormRequest> {
         Some(request)
+    }
+
+    /// Return true when this view already presents the matching app-server request.
+    fn matches_app_server_request(&self, _request: &ResolvedAppServerRequest) -> bool {
+        false
     }
 
     /// Dismiss a request that was resolved by another client.

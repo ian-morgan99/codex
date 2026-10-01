@@ -54,18 +54,26 @@ pub enum BedrockSetupParams {
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
     Environment { region: String },
-    #[serde(rename_all = "camelCase")]
-    #[ts(rename_all = "camelCase")]
-    AccessKeys {
-        access_key_id: String,
-        secret_access_key: String,
-        #[ts(optional = nullable)]
-        session_token: Option<String>,
-        region: String,
-    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct BedrockSetupResponse {}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct BedrockCheckGovCloudRequirementsParams {}
+
+/// Advisory check of the current Bedrock configuration after login or setup.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct BedrockCheckGovCloudRequirementsResponse {
+    /// Whether the active Bedrock authentication resolves to a GovCloud region.
+    pub is_gov_cloud: bool,
+    /// Whether GovCloud is selected and the managed requirements miss the baseline.
+    /// A false value is not a general certification of the network configuration.
+    pub should_warn: bool,
+}

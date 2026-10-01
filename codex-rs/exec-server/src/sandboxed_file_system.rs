@@ -5,9 +5,12 @@ use codex_utils_path_uri::PathUri;
 use tokio::io;
 use tokio_util::io::ReaderStream;
 
+use crate::CapabilityRootsDiscoverParams;
+use crate::CapabilityRootsDiscoverResponse;
 use crate::CopyOptions;
 use crate::CreateDirectoryOptions;
-use crate::ExecServerRuntimePaths;
+use crate::DiscoverV2CapabilitiesResponse;
+use crate::ExecServerRuntimeOptions;
 use crate::ExecutorFileSystem;
 use crate::ExecutorFileSystemFuture;
 use crate::FILE_READ_CHUNK_SIZE;
@@ -22,6 +25,7 @@ use crate::RemoveOptions;
 use crate::WalkOptions;
 use crate::WalkOutcome;
 use crate::WriteFileOptions;
+use crate::discover_v2::capability_locations::CapabilityLocation;
 use crate::fs_helper::FsHelperPayload;
 use crate::fs_helper::FsHelperRequest;
 use crate::fs_sandbox::FileSystemSandboxRunner;
@@ -41,6 +45,41 @@ pub struct SandboxedFileSystem {
 }
 
 impl SandboxedFileSystem {
+    pub(crate) async fn load_sandboxed_capability_discoveries(
+        &self,
+        locations: Vec<CapabilityLocation>,
+        warnings: Vec<String>,
+        sandbox: &FileSystemSandboxContext,
+    ) -> FileSystemResult<DiscoverV2CapabilitiesResponse> {
+        require_platform_sandbox(Some(sandbox))?;
+        self.run_sandboxed(
+            sandbox,
+            FsHelperRequest::LoadCapabilityDiscoveries {
+                locations,
+                warnings,
+            },
+        )
+        .await?
+        .expect_capability_discoveries()
+        .map_err(map_sandbox_error)
+    }
+
+    #[tracing::instrument(
+        name = "capability_roots.discover_v1",
+        skip_all,
+        fields(root_count = params.roots.len())
+    )]
+    pub(crate) async fn discover_capability_roots(
+        &self,
+        params: CapabilityRootsDiscoverParams,
+        sandbox: &FileSystemSandboxContext,
+    ) -> FileSystemResult<CapabilityRootsDiscoverResponse> {
+        self.run_sandboxed(sandbox, FsHelperRequest::DiscoverCapabilityRoots(params))
+            .await?
+            .expect_capability_roots_discover()
+            .map_err(map_sandbox_error)
+    }
+
     pub(crate) async fn open_file_for_read(
         &self,
         path: &PathUri,
@@ -57,7 +96,7 @@ impl SandboxedFileSystem {
             .map_err(map_sandbox_error)
     }
 
-    pub fn new(runtime_paths: ExecServerRuntimePaths) -> Self {
+    pub fn new(runtime_paths: ExecServerRuntimeOptions) -> Self {
         Self {
             sandbox_runner: FileSystemSandboxRunner::new(runtime_paths),
         }
@@ -426,7 +465,7 @@ fn require_platform_sandbox(
     sandbox: Option<&FileSystemSandboxContext>,
 ) -> FileSystemResult<&FileSystemSandboxContext> {
     sandbox
-        .filter(|sandbox| sandbox.should_run_in_sandbox())
+        .filter(|sandbox| sandbox.should_read_from_sandbox() || sandbox.should_write_into_sandbox())
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,

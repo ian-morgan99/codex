@@ -1,4 +1,7 @@
+use crate::ApplicationRequirementsToml;
 use codex_features::FeatureToml;
+use codex_model_provider_info::ModelProviderInfo;
+pub use codex_model_provider_info::ResidencyRequirement;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::SandboxMode;
@@ -10,12 +13,13 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::Error as _;
-use serde::de::value::Error as ValueDeserializerError;
-use serde::de::value::StrDeserializer;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fmt;
 use std::path::PathBuf;
+use std::str::FromStr;
 use wildmatch::WildMatchPattern;
 
 use super::requirements_exec_policy::RequirementsExecPolicyToml;
@@ -164,6 +168,8 @@ pub struct ConfigRequirements {
     pub sqlite_home: Option<Sourced<AbsolutePathBuf>>,
     pub log_dir: Option<Sourced<AbsolutePathBuf>>,
     pub model_catalog_json: Option<Sourced<AbsolutePathBuf>>,
+    pub model_provider: Option<Sourced<String>>,
+    pub model_providers: Option<Sourced<HashMap<String, ModelProviderInfo>>>,
     pub check_for_update_on_startup: Option<Sourced<bool>>,
     pub allow_login_shell: Option<Sourced<bool>>,
     pub feedback: Option<Sourced<FeedbackConfigToml>>,
@@ -172,7 +178,6 @@ pub struct ConfigRequirements {
     pub auto_review_required_models: Option<Sourced<BTreeSet<String>>>,
     pub permission_profile: ConstrainedWithSource<PermissionProfile>,
     pub windows_sandbox_mode: ConstrainedWithSource<Option<WindowsSandboxModeToml>>,
-    pub windows_sandbox_private_desktop: Option<Sourced<bool>>,
     pub web_search_mode: ConstrainedWithSource<WebSearchMode>,
     pub allow_managed_hooks_only: Option<Sourced<bool>>,
     pub allow_appshots: Option<Sourced<bool>>,
@@ -187,12 +192,15 @@ pub struct ConfigRequirements {
     pub enforce_residency: ConstrainedWithSource<Option<ResidencyRequirement>>,
     /// Managed network constraints derived from requirements.
     pub network: Option<Sourced<NetworkConstraints>>,
+    pub application: Option<Sourced<ApplicationRequirementsToml>>,
     /// Managed filesystem constraints derived from requirements.
     pub filesystem: Option<Sourced<FilesystemConstraints>>,
     /// Managed instructions included independently of ordinary developer instructions.
     pub additional_developer_instructions: Option<Sourced<String>>,
     /// Source for the managed guardian policy config, when one is configured.
     pub guardian_policy_config_source: Option<RequirementSource>,
+    /// Source for the managed extra guardian policy, when one is configured.
+    pub guardian_extra_policy_source: Option<RequirementSource>,
 }
 
 impl Default for ConfigRequirements {
@@ -205,6 +213,8 @@ impl Default for ConfigRequirements {
             sqlite_home: None,
             log_dir: None,
             model_catalog_json: None,
+            model_provider: None,
+            model_providers: None,
             check_for_update_on_startup: None,
             allow_login_shell: None,
             feedback: None,
@@ -225,7 +235,6 @@ impl Default for ConfigRequirements {
                 Constrained::allow_any(/*initial_value*/ None),
                 /*source*/ None,
             ),
-            windows_sandbox_private_desktop: None,
             web_search_mode: ConstrainedWithSource::new(
                 Constrained::allow_any(WebSearchMode::Cached),
                 /*source*/ None,
@@ -245,9 +254,11 @@ impl Default for ConfigRequirements {
                 /*source*/ None,
             ),
             network: None,
+            application: None,
             filesystem: None,
             additional_developer_instructions: None,
             guardian_policy_config_source: None,
+            guardian_extra_policy_source: None,
         }
     }
 }
@@ -425,7 +436,30 @@ pub struct NetworkRequirementsToml {
     /// network enforcement is active. User allowlist entries are ignored.
     pub managed_allowed_domains_only: Option<bool>,
     pub unix_sockets: Option<NetworkUnixSocketPermissionsToml>,
+    /// MXC requires true when managed networking is enabled; an explicit false is rejected.
     pub allow_local_binding: Option<bool>,
+    /// Requirements-only header injections. These annotate matching requests
+    /// without changing whether non-matching requests are allowed.
+    pub header_injections: Option<Vec<NetworkHeaderInjectionToml>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct NetworkHeaderInjectionToml {
+    pub host: String,
+    pub methods: Vec<String>,
+    pub path_prefixes: Vec<String>,
+    pub headers: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for NetworkHeaderInjectionToml {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetworkHeaderInjectionToml")
+            .field("host", &self.host)
+            .field("methods", &self.methods)
+            .field("path_prefixes", &self.path_prefixes)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
@@ -448,6 +482,7 @@ struct RawNetworkRequirementsToml {
     #[serde(default)]
     allow_unix_sockets: Option<Vec<String>>,
     allow_local_binding: Option<bool>,
+    header_injections: Option<Vec<NetworkHeaderInjectionToml>>,
 }
 
 impl<'de> Deserialize<'de> for NetworkRequirementsToml {
@@ -470,6 +505,7 @@ impl<'de> Deserialize<'de> for NetworkRequirementsToml {
             unix_sockets,
             allow_unix_sockets,
             allow_local_binding,
+            header_injections,
         } = raw;
 
         if domains.is_some() && (allowed_domains.is_some() || denied_domains.is_some()) {
@@ -497,6 +533,7 @@ impl<'de> Deserialize<'de> for NetworkRequirementsToml {
             unix_sockets: unix_sockets
                 .or_else(|| legacy_unix_socket_permissions_from_list(allow_unix_sockets)),
             allow_local_binding,
+            header_injections,
         })
     }
 }
@@ -548,6 +585,7 @@ pub struct NetworkConstraints {
     pub managed_allowed_domains_only: Option<bool>,
     pub unix_sockets: Option<NetworkUnixSocketPermissionsToml>,
     pub allow_local_binding: Option<bool>,
+    pub header_injections: Option<Vec<NetworkHeaderInjectionToml>>,
 }
 
 impl<'de> Deserialize<'de> for NetworkConstraints {
@@ -573,6 +611,7 @@ impl From<NetworkRequirementsToml> for NetworkConstraints {
             managed_allowed_domains_only,
             unix_sockets,
             allow_local_binding,
+            header_injections,
         } = value;
         Self {
             enabled,
@@ -585,6 +624,7 @@ impl From<NetworkRequirementsToml> for NetworkConstraints {
             managed_allowed_domains_only,
             unix_sockets,
             allow_local_binding,
+            header_injections,
         }
     }
 }
@@ -672,25 +712,49 @@ impl FilesystemDenyReadPattern {
     }
 
     pub fn from_input(input: &str) -> Result<Self, String> {
+        codex_utils_path_uri::PathUri::validate_config_path_text(
+            input,
+            crate::path_context::convention(),
+        )
+        .map_err(|error| error.to_string())?;
         if !input.chars().any(is_glob_metacharacter) {
             let path = deserialize_absolute_path(input)?;
-            return Ok(Self(path.to_string_lossy().into_owned()));
+            validate_literal_denial_path(&path)?;
+            return Ok(Self(path));
         }
 
         let (directory_prefix, suffix) = split_glob_pattern(input);
+        if crate::path_context::convention() == codex_utils_path_uri::PathConvention::Windows
+            && matches!(input.as_bytes(), [b'/' | b'\\', b'/' | b'\\', ..])
+            && !matches!(
+                directory_prefix.as_bytes(),
+                [b'/' | b'\\', b'/' | b'\\', ..]
+            )
+        {
+            return Err(
+                "filesystem denial glob requires a literal UNC server and share".to_string(),
+            );
+        }
         let normalized_prefix = if directory_prefix.is_empty() {
             deserialize_absolute_path(".")?
         } else {
             deserialize_absolute_path(directory_prefix)?
         };
-        let normalized_prefix = normalized_prefix.to_string_lossy();
+        // The prefix is literal even when supplied home/base facts contain
+        // glob syntax. Reject it before appending the user's pattern suffix.
+        validate_literal_denial_path(&normalized_prefix)?;
         let normalized = if suffix.is_empty() {
-            normalized_prefix.into_owned()
+            normalized_prefix
         } else if normalized_prefix == "/" {
             format!("/{suffix}")
         } else {
             format!("{normalized_prefix}/{suffix}")
         };
+        codex_utils_path_uri::PathUri::validate_config_path_text(
+            &normalized,
+            crate::path_context::convention(),
+        )
+        .map_err(|error| error.to_string())?;
         Ok(Self(normalized))
     }
 }
@@ -711,9 +775,16 @@ impl<'de> Deserialize<'de> for FilesystemDenyReadPattern {
     }
 }
 
-fn deserialize_absolute_path(input: &str) -> Result<AbsolutePathBuf, String> {
-    AbsolutePathBuf::deserialize(StrDeserializer::<ValueDeserializerError>::new(input))
-        .map_err(|err| err.to_string())
+fn validate_literal_denial_path(path: &str) -> Result<(), String> {
+    let convention = crate::path_context::convention();
+    codex_utils_path_uri::LegacyAppPathString::from_string(path)
+        .to_path_uri(convention)
+        .and_then(|path| path.validate_glob_directory(convention))
+        .map_err(|error| error.to_string())
+}
+
+fn deserialize_absolute_path(input: &str) -> Result<String, String> {
+    crate::path_context::resolve(input)
 }
 
 fn split_glob_pattern(input: &str) -> (&str, &str) {
@@ -729,7 +800,8 @@ fn split_glob_pattern(input: &str) -> (&str, &str) {
     match separator_index {
         Some(0) => ("/", &input[1..]),
         Some(index)
-            if cfg!(windows)
+            if crate::path_context::convention()
+                == codex_utils_path_uri::PathConvention::Windows
                 && index == 2
                 && input.as_bytes().get(1) == Some(&b':')
                 && input.as_bytes().get(2).is_some() =>
@@ -742,7 +814,7 @@ fn split_glob_pattern(input: &str) -> (&str, &str) {
 }
 
 fn is_path_separator(ch: char) -> bool {
-    if cfg!(windows) {
+    if crate::path_context::convention() == codex_utils_path_uri::PathConvention::Windows {
         ch == '/' || ch == '\\'
     } else {
         ch == '/'
@@ -797,13 +869,21 @@ impl fmt::Display for WebSearchModeRequirement {
 
 #[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct WindowsRequirementsToml {
-    pub allowed_sandbox_implementations: Option<Vec<WindowsSandboxModeToml>>,
-    pub sandbox_private_desktop: Option<bool>,
+    pub allowed_sandbox_implementations: Option<Vec<WindowsSandboxImplementationToml>>,
+    /// False blocks both explicit MXC configuration and automatic selection.
+    pub allow_mxc: Option<bool>,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowsSandboxImplementationToml {
+    Elevated,
+    Unelevated,
 }
 
 impl WindowsRequirementsToml {
     pub fn is_empty(&self) -> bool {
-        self.allowed_sandbox_implementations.is_none() && self.sandbox_private_desktop.is_none()
+        self.allowed_sandbox_implementations.is_none() && self.allow_mxc.is_none()
     }
 }
 
@@ -822,11 +902,53 @@ impl FeatureRequirementsToml {
 #[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppToolRequirementToml {
     pub approval_mode: Option<AppToolApproval>,
+    /// Opt-in analytics extraction for this exact tool, not a tool argument.
+    /// The highest-priority rule wins as a whole, including unsupported formats.
+    pub analytics_result_source: Option<AppToolResultSourceRequirementToml>,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AppToolResultSourceRequirementToml {
+    /// Result format to parse; currently only `detailed_message_search_v1` is supported.
+    pub format: AppToolResultSourceFormat,
+    /// Source kind emitted alongside each extracted ID.
+    #[serde(rename = "type")]
+    pub source_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppToolResultSourceFormat {
+    DetailedMessageSearchV1,
+    /// Keep unknown formats so higher-priority rules still override lower ones.
+    Unknown(String),
+}
+
+impl FromStr for AppToolResultSourceFormat {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value {
+            "detailed_message_search_v1" => Self::DetailedMessageSearchV1,
+            _ => Self::Unknown(value.to_string()),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for AppToolResultSourceFormat {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(D::Error::custom)
+    }
 }
 
 impl AppToolRequirementToml {
     pub fn is_empty(&self) -> bool {
-        self.approval_mode.is_none()
+        self.approval_mode.is_none() && self.analytics_result_source.is_none()
     }
 }
 
@@ -897,6 +1019,9 @@ pub(crate) fn merge_app_requirements_descending(
             if base_tool.approval_mode.is_none() {
                 base_tool.approval_mode = incoming_tool.approval_mode;
             }
+            if base_tool.analytics_result_source.is_none() {
+                base_tool.analytics_result_source = incoming_tool.analytics_result_source;
+            }
         }
     }
 }
@@ -911,6 +1036,10 @@ pub struct ConfigRequirementsToml {
     pub sqlite_home: Option<AbsolutePathBuf>,
     pub log_dir: Option<AbsolutePathBuf>,
     pub model_catalog_json: Option<AbsolutePathBuf>,
+    /// Exact provider selection, overriding local and session configuration.
+    pub model_provider: Option<String>,
+    /// Complete provider definitions; each entry replaces the configured provider.
+    pub model_providers: Option<HashMap<String, ModelProviderInfo>>,
     pub check_for_update_on_startup: Option<bool>,
     pub allow_login_shell: Option<bool>,
     pub feedback: Option<FeedbackConfigToml>,
@@ -940,11 +1069,13 @@ pub struct ConfigRequirementsToml {
     pub enforce_residency: Option<ResidencyRequirement>,
     #[serde(rename = "experimental_network")]
     pub network: Option<NetworkRequirementsToml>,
+    pub application: Option<ApplicationRequirementsToml>,
     pub permissions: Option<PermissionsRequirementsToml>,
     pub auto_review: Option<AutoReviewRequirementsToml>,
     pub models: Option<ModelsRequirementsToml>,
     pub additional_developer_instructions: Option<String>,
     pub guardian_policy_config: Option<String>,
+    pub guardian_extra_policy: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -1016,6 +1147,8 @@ pub struct ConfigRequirementsWithSources {
     pub sqlite_home: Option<Sourced<AbsolutePathBuf>>,
     pub log_dir: Option<Sourced<AbsolutePathBuf>>,
     pub model_catalog_json: Option<Sourced<AbsolutePathBuf>>,
+    pub model_provider: Option<Sourced<String>>,
+    pub model_providers: Option<Sourced<HashMap<String, ModelProviderInfo>>>,
     pub check_for_update_on_startup: Option<Sourced<bool>>,
     pub allow_login_shell: Option<Sourced<bool>>,
     pub feedback: Option<Sourced<FeedbackConfigToml>>,
@@ -1042,11 +1175,13 @@ pub struct ConfigRequirementsWithSources {
     pub rules: Option<Sourced<RequirementsExecPolicyToml>>,
     pub enforce_residency: Option<Sourced<ResidencyRequirement>>,
     pub network: Option<Sourced<NetworkRequirementsToml>>,
+    pub application: Option<Sourced<ApplicationRequirementsToml>>,
     pub permissions: Option<Sourced<PermissionsRequirementsToml>>,
     pub auto_review: Option<Sourced<AutoReviewRequirementsToml>>,
     pub models: Option<Sourced<ModelsRequirementsToml>>,
     pub additional_developer_instructions: Option<Sourced<String>>,
     pub guardian_policy_config: Option<Sourced<String>>,
+    pub guardian_extra_policy: Option<Sourced<String>>,
 }
 
 impl ConfigRequirementsWithSources {
@@ -1075,6 +1210,8 @@ impl ConfigRequirementsWithSources {
             sqlite_home: _,
             log_dir: _,
             model_catalog_json: _,
+            model_provider: _,
+            model_providers: _,
             check_for_update_on_startup: _,
             allow_login_shell: _,
             feedback: _,
@@ -1102,11 +1239,13 @@ impl ConfigRequirementsWithSources {
             rules: _,
             enforce_residency: _,
             network: _,
+            application: _,
             permissions: _,
             auto_review: _,
             models: _,
             additional_developer_instructions: _,
             guardian_policy_config: _,
+            guardian_extra_policy: _,
         } = &other;
 
         let mut other = other;
@@ -1116,6 +1255,13 @@ impl ConfigRequirementsWithSources {
             .is_some_and(|value| value.trim().is_empty())
         {
             other.guardian_policy_config = None;
+        }
+        if other
+            .guardian_extra_policy
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            other.guardian_extra_policy = None;
         }
         fill_missing_take!(
             self,
@@ -1129,6 +1275,8 @@ impl ConfigRequirementsWithSources {
                 sqlite_home,
                 log_dir,
                 model_catalog_json,
+                model_provider,
+                model_providers,
                 check_for_update_on_startup,
                 allow_login_shell,
                 feedback,
@@ -1154,10 +1302,12 @@ impl ConfigRequirementsWithSources {
                 rules,
                 enforce_residency,
                 network,
+                application,
                 permissions,
                 models,
                 additional_developer_instructions,
                 guardian_policy_config,
+                guardian_extra_policy,
             }
         );
 
@@ -1211,6 +1361,8 @@ impl ConfigRequirementsWithSources {
             sqlite_home,
             log_dir,
             model_catalog_json,
+            model_provider,
+            model_providers,
             check_for_update_on_startup,
             allow_login_shell,
             feedback,
@@ -1237,11 +1389,13 @@ impl ConfigRequirementsWithSources {
             rules,
             enforce_residency,
             network,
+            application,
             permissions,
             auto_review,
             models,
             additional_developer_instructions,
             guardian_policy_config,
+            guardian_extra_policy,
         } = self;
         ConfigRequirementsToml {
             allowed_login_methods: allowed_login_methods.map(|sourced| sourced.value),
@@ -1251,6 +1405,8 @@ impl ConfigRequirementsWithSources {
             sqlite_home: sqlite_home.map(|sourced| sourced.value),
             log_dir: log_dir.map(|sourced| sourced.value),
             model_catalog_json: model_catalog_json.map(|sourced| sourced.value),
+            model_provider: model_provider.map(|sourced| sourced.value),
+            model_providers: model_providers.map(|sourced| sourced.value),
             check_for_update_on_startup: check_for_update_on_startup.map(|sourced| sourced.value),
             allow_login_shell: allow_login_shell.map(|sourced| sourced.value),
             feedback: feedback.map(|sourced| sourced.value),
@@ -1279,12 +1435,14 @@ impl ConfigRequirementsWithSources {
             rules: rules.map(|sourced| sourced.value),
             enforce_residency: enforce_residency.map(|sourced| sourced.value),
             network: network.map(|sourced| sourced.value),
+            application: application.map(|sourced| sourced.value),
             permissions: permissions.map(|sourced| sourced.value),
             auto_review: auto_review.map(|sourced| sourced.value),
             models: models.map(|sourced| sourced.value),
             additional_developer_instructions: additional_developer_instructions
                 .map(|sourced| sourced.value),
             guardian_policy_config: guardian_policy_config.map(|sourced| sourced.value),
+            guardian_extra_policy: guardian_extra_policy.map(|sourced| sourced.value),
         }
     }
 }
@@ -1329,12 +1487,6 @@ impl From<SandboxMode> for SandboxModeRequirement {
     }
 }
 
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ResidencyRequirement {
-    Us,
-}
-
 impl ConfigRequirementsToml {
     pub fn apply_remote_sandbox_config(&mut self, hostname: Option<&str>) {
         let Some(remote_sandbox_config) = self.remote_sandbox_config.as_ref() else {
@@ -1360,6 +1512,8 @@ impl ConfigRequirementsToml {
             && self.sqlite_home.is_none()
             && self.log_dir.is_none()
             && self.model_catalog_json.is_none()
+            && self.model_provider.is_none()
+            && self.model_providers.as_ref().is_none_or(HashMap::is_empty)
             && self.check_for_update_on_startup.is_none()
             && self.allow_login_shell.is_none()
             && self
@@ -1417,6 +1571,10 @@ impl ConfigRequirementsToml {
             && self.rules.is_none()
             && self.enforce_residency.is_none()
             && self.network.is_none()
+            && self
+                .application
+                .as_ref()
+                .is_none_or(|application| application.network.is_none())
             && self.permissions.is_none()
             && self.auto_review.as_ref().is_none_or(|auto_review| {
                 auto_review.ignore_rules.as_ref().is_none_or(Vec::is_empty)
@@ -1432,6 +1590,10 @@ impl ConfigRequirementsToml {
             && self.additional_developer_instructions.is_none()
             && self
                 .guardian_policy_config
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            && self
+                .guardian_extra_policy
                 .as_deref()
                 .is_none_or(|value| value.trim().is_empty())
     }
@@ -1453,6 +1615,10 @@ impl ConfigRequirementsToml {
         apply_exact!(sqlite_home);
         apply_exact!(log_dir);
         apply_exact!(model_catalog_json);
+        apply_exact!(model_provider);
+        if let Some(providers) = &self.model_providers {
+            config.model_providers.extend(providers.clone());
+        }
         apply_exact!(check_for_update_on_startup);
         apply_exact!(allow_login_shell);
 
@@ -1467,21 +1633,23 @@ impl ConfigRequirementsToml {
         if let Some(enabled) = self.feedback.as_ref().and_then(|feedback| feedback.enabled) {
             config.feedback.get_or_insert_default().enabled = Some(enabled);
         }
-        if let Some(sandbox_private_desktop) = self
-            .windows
-            .as_ref()
-            .and_then(|windows| windows.sandbox_private_desktop)
-        {
-            config
-                .windows
-                .get_or_insert_default()
-                .sandbox_private_desktop = Some(sandbox_private_desktop);
-        }
     }
 
     /// Returns the exact managed field affected by editing `segments`.
     pub fn exact_requirement_for_config_path(&self, segments: &[String]) -> Option<&'static str> {
+        if self.model_providers.as_ref().is_some_and(|providers| {
+            providers
+                .keys()
+                .any(|id| config_paths_overlap(segments, &["model_providers", id]))
+        }) {
+            return Some("model_providers");
+        }
         let managed_fields: [(bool, &[&str], &'static str); 9] = [
+            (
+                self.model_provider.is_some(),
+                &["model_provider"],
+                "model_provider",
+            ),
             (self.sqlite_home.is_some(), &["sqlite_home"], "sqlite_home"),
             (self.log_dir.is_some(), &["log_dir"], "log_dir"),
             (
@@ -1506,14 +1674,6 @@ impl ConfigRequirementsToml {
                     .is_some(),
                 &["feedback", "enabled"],
                 "feedback.enabled",
-            ),
-            (
-                self.windows
-                    .as_ref()
-                    .and_then(|windows| windows.sandbox_private_desktop)
-                    .is_some(),
-                &["windows", "sandbox_private_desktop"],
-                "windows.sandbox_private_desktop",
             ),
             (
                 self.cli_auth_credentials_store.is_some(),
@@ -1577,6 +1737,8 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             sqlite_home,
             log_dir,
             model_catalog_json,
+            model_provider,
+            model_providers,
             check_for_update_on_startup,
             allow_login_shell,
             feedback,
@@ -1603,11 +1765,13 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             rules,
             enforce_residency,
             network,
+            application,
             permissions,
             auto_review,
             models: _,
             additional_developer_instructions,
             guardian_policy_config,
+            guardian_extra_policy,
         } = toml;
 
         let auto_review_required_models = auto_review
@@ -1753,62 +1917,82 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
                 /*source*/ None,
             ),
         };
-        let (windows_sandbox_mode, windows_sandbox_private_desktop) = match windows {
+        let mxc_requirement_source = windows
+            .as_ref()
+            .filter(|windows| windows.value.allow_mxc == Some(false))
+            .map(|windows| windows.source.clone());
+        let mut windows_sandbox_mode = match windows {
             Some(Sourced {
                 value:
                     WindowsRequirementsToml {
-                        allowed_sandbox_implementations,
-                        sandbox_private_desktop,
+                        allowed_sandbox_implementations: Some(implementations),
+                        allow_mxc: _,
                     },
                 source: requirement_source,
             }) => {
-                let sandbox_private_desktop = sandbox_private_desktop
-                    .map(|value| Sourced::new(value, requirement_source.clone()));
-                let sandbox_mode = match allowed_sandbox_implementations {
-                    Some(implementations) => {
-                        if implementations.is_empty() {
-                            return Err(ConstraintError::empty_field(
-                                "windows.allowed_sandbox_implementations",
-                            ));
-                        }
-                        // Prefer elevated when both Windows sandbox implementations are allowed.
-                        let initial_value =
-                            if implementations.contains(&WindowsSandboxModeToml::Elevated) {
-                                WindowsSandboxModeToml::Elevated
-                            } else {
-                                WindowsSandboxModeToml::Unelevated
-                            };
+                if implementations.is_empty() {
+                    return Err(ConstraintError::empty_field(
+                        "windows.allowed_sandbox_implementations",
+                    ));
+                }
+                // Prefer elevated when both Windows sandbox implementations are allowed.
+                let initial_value =
+                    if implementations.contains(&WindowsSandboxImplementationToml::Elevated) {
+                        WindowsSandboxModeToml::Elevated
+                    } else {
+                        WindowsSandboxModeToml::Unelevated
+                    };
 
-                        let requirement_source_for_error = requirement_source.clone();
-                        let constrained = Constrained::new(
-                            Some(initial_value),
-                            move |candidate| match candidate {
-                                Some(candidate) if implementations.contains(candidate) => Ok(()),
-                                _ => Err(ConstraintError::InvalidValue {
-                                    field_name: "windows.sandbox",
-                                    candidate: format!("{candidate:?}"),
-                                    allowed: format!("{implementations:?}"),
-                                    requirement_source: requirement_source_for_error.clone(),
-                                }),
-                            },
-                        )?;
-                        ConstrainedWithSource::new(constrained, Some(requirement_source))
-                    }
-                    None => ConstrainedWithSource::new(
-                        Constrained::allow_any(/*initial_value*/ None),
-                        /*source*/ None,
-                    ),
-                };
-                (sandbox_mode, sandbox_private_desktop)
+                let requirement_source_for_error = requirement_source.clone();
+                let constrained =
+                    Constrained::new(Some(initial_value), move |candidate| match candidate {
+                        Some(WindowsSandboxModeToml::Mxc) => Ok(()),
+                        Some(WindowsSandboxModeToml::Elevated)
+                            if implementations
+                                .contains(&WindowsSandboxImplementationToml::Elevated) =>
+                        {
+                            Ok(())
+                        }
+                        Some(WindowsSandboxModeToml::Unelevated)
+                            if implementations
+                                .contains(&WindowsSandboxImplementationToml::Unelevated) =>
+                        {
+                            Ok(())
+                        }
+                        _ => Err(ConstraintError::InvalidValue {
+                            field_name: "windows.sandbox",
+                            candidate: format!("{candidate:?}"),
+                            allowed: format!("{implementations:?}"),
+                            requirement_source: requirement_source_for_error.clone(),
+                        }),
+                    })?;
+                ConstrainedWithSource::new(constrained, Some(requirement_source))
             }
-            None => (
-                ConstrainedWithSource::new(
-                    Constrained::allow_any(/*initial_value*/ None),
-                    /*source*/ None,
-                ),
-                None,
+            Some(Sourced {
+                value:
+                    WindowsRequirementsToml {
+                        allowed_sandbox_implementations: None,
+                        allow_mxc: _,
+                    },
+                ..
+            })
+            | None => ConstrainedWithSource::new(
+                Constrained::allow_any(/*initial_value*/ None),
+                /*source*/ None,
             ),
         };
+        if let Some(requirement_source) = mxc_requirement_source {
+            windows_sandbox_mode.add_validator(move |candidate| match candidate {
+                Some(WindowsSandboxModeToml::Mxc) => Err(ConstraintError::InvalidValue {
+                    field_name: "windows.sandbox",
+                    candidate: format!("{candidate:?}"),
+                    allowed: "windows.allow_mxc = false".to_string(),
+                    requirement_source: requirement_source.clone(),
+                }),
+                Some(WindowsSandboxModeToml::Elevated | WindowsSandboxModeToml::Unelevated)
+                | None => Ok(()),
+            })?;
+        }
         let exec_policy = match rules {
             Some(Sourced { value, source }) => {
                 let policy = value.to_requirements_policy().map_err(|err| {
@@ -1932,6 +2116,7 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             Sourced::new(FilesystemConstraints::from(value), source)
         });
         let guardian_policy_config_source = guardian_policy_config.map(|sourced| sourced.source);
+        let guardian_extra_policy_source = guardian_extra_policy.map(|sourced| sourced.source);
         Ok(ConfigRequirements {
             allowed_login_methods,
             allowed_chatgpt_workspaces,
@@ -1940,6 +2125,8 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             sqlite_home,
             log_dir,
             model_catalog_json,
+            model_provider,
+            model_providers,
             check_for_update_on_startup,
             allow_login_shell,
             feedback,
@@ -1948,7 +2135,6 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             auto_review_required_models,
             permission_profile,
             windows_sandbox_mode,
-            windows_sandbox_private_desktop,
             web_search_mode,
             allow_managed_hooks_only,
             allow_appshots,
@@ -1962,9 +2148,11 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             exec_policy,
             enforce_residency,
             network,
+            application,
             filesystem,
             additional_developer_instructions,
             guardian_policy_config_source,
+            guardian_extra_policy_source,
         })
     }
 }
@@ -2040,10 +2228,6 @@ mod tests {
             feedback: Some(FeedbackConfigToml {
                 enabled: Some(false),
             }),
-            windows: Some(WindowsRequirementsToml {
-                sandbox_private_desktop: Some(false),
-                ..Default::default()
-            }),
             ..Default::default()
         };
         let cases: &[(&[&str], Option<&str>)] = &[
@@ -2061,16 +2245,8 @@ mod tests {
             ),
             (&["allow_login_shell"], Some("allow_login_shell")),
             (&["feedback", "enabled"], Some("feedback.enabled")),
-            (
-                &["windows", "sandbox_private_desktop"],
-                Some("windows.sandbox_private_desktop"),
-            ),
             (&[], Some("sqlite_home")),
             (&["feedback"], Some("feedback.enabled")),
-            (
-                &["windows", "sandbox_private_desktop", "value"],
-                Some("windows.sandbox_private_desktop"),
-            ),
             (&["feedback", "other"], None),
             (&["windows", "sandbox"], None),
         ];
@@ -2113,6 +2289,8 @@ mod tests {
             sqlite_home,
             log_dir,
             model_catalog_json,
+            model_provider,
+            model_providers,
             check_for_update_on_startup,
             allow_login_shell,
             feedback,
@@ -2140,11 +2318,13 @@ mod tests {
             rules,
             enforce_residency,
             network,
+            application,
             permissions,
             auto_review,
             models,
             additional_developer_instructions,
             guardian_policy_config,
+            guardian_extra_policy,
         } = toml;
         ConfigRequirementsWithSources {
             allowed_login_methods: allowed_login_methods
@@ -2158,6 +2338,10 @@ mod tests {
             sqlite_home: sqlite_home.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             log_dir: log_dir.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             model_catalog_json: model_catalog_json
+                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
+            model_provider: model_provider
+                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
+            model_providers: model_providers
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             check_for_update_on_startup: check_for_update_on_startup
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
@@ -2200,12 +2384,15 @@ mod tests {
             enforce_residency: enforce_residency
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             network: network.map(|value| Sourced::new(value, RequirementSource::Unknown)),
+            application: application.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             permissions: permissions.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             auto_review: auto_review.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             models: models.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             additional_developer_instructions: additional_developer_instructions
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             guardian_policy_config: guardian_policy_config
+                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
+            guardian_extra_policy: guardian_extra_policy
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
         }
     }
@@ -2390,6 +2577,7 @@ mod tests {
         assert_eq!(
             requirements.browser_use,
             Some(BrowserUseRequirementsToml {
+                allow_webmcp: None,
                 allow_history_access: Some(false),
                 disable_auto_review: Some(true),
                 allow_global_persistent_approval: Some(false),
@@ -2622,6 +2810,7 @@ mod tests {
             entries: BTreeMap::from([("personality".to_string(), true)]),
         };
         let browser_use = BrowserUseRequirementsToml {
+            allow_webmcp: None,
             allow_history_access: Some(false),
             disable_auto_review: Some(true),
             allow_global_persistent_approval: None,
@@ -2657,13 +2846,14 @@ mod tests {
             enabled: Some(false),
         };
         let windows = WindowsRequirementsToml {
-            allowed_sandbox_implementations: None,
-            sandbox_private_desktop: Some(true),
+            allowed_sandbox_implementations: Some(vec![WindowsSandboxImplementationToml::Elevated]),
+            allow_mxc: None,
         };
         let enforce_residency = ResidencyRequirement::Us;
         let enforce_source = source.clone();
         let additional_developer_instructions = "Follow the company policy.".to_string();
         let guardian_policy_config = "Use the company-managed guardian policy.".to_string();
+        let guardian_extra_policy = "Use the company-managed extra policy.".to_string();
 
         // Intentionally constructed without `..Default::default()` so adding a new field to
         // `ConfigRequirementsToml` forces this test to be updated.
@@ -2675,6 +2865,8 @@ mod tests {
             sqlite_home: Some(sqlite_home.clone()),
             log_dir: Some(log_dir.clone()),
             model_catalog_json: Some(model_catalog_json.clone()),
+            model_provider: Some("gateway".to_string()),
+            model_providers: Some(HashMap::new()),
             check_for_update_on_startup: Some(false),
             allow_login_shell: Some(false),
             feedback: Some(feedback.clone()),
@@ -2702,11 +2894,13 @@ mod tests {
             rules: None,
             enforce_residency: Some(enforce_residency),
             network: None,
+            application: None,
             permissions: None,
             auto_review: Some(auto_review.clone()),
             models: Some(models.clone()),
             additional_developer_instructions: Some(additional_developer_instructions.clone()),
             guardian_policy_config: Some(guardian_policy_config.clone()),
+            guardian_extra_policy: Some(guardian_extra_policy.clone()),
         };
 
         target.merge_unset_fields(source.clone(), other);
@@ -2733,6 +2927,8 @@ mod tests {
                 sqlite_home: Some(Sourced::new(sqlite_home, source.clone())),
                 log_dir: Some(Sourced::new(log_dir, source.clone())),
                 model_catalog_json: Some(Sourced::new(model_catalog_json, source.clone())),
+                model_provider: Some(Sourced::new("gateway".to_string(), source.clone())),
+                model_providers: Some(Sourced::new(HashMap::new(), source.clone())),
                 check_for_update_on_startup: Some(Sourced::new(
                     /*value*/ false,
                     source.clone(),
@@ -2786,6 +2982,7 @@ mod tests {
                 rules: None,
                 enforce_residency: Some(Sourced::new(enforce_residency, enforce_source)),
                 network: None,
+                application: None,
                 permissions: None,
                 auto_review: Some(Sourced::new(auto_review, source.clone())),
                 models: Some(Sourced::new(models, source.clone())),
@@ -2793,7 +2990,8 @@ mod tests {
                     additional_developer_instructions,
                     source.clone(),
                 )),
-                guardian_policy_config: Some(Sourced::new(guardian_policy_config, source)),
+                guardian_policy_config: Some(Sourced::new(guardian_policy_config, source.clone())),
+                guardian_extra_policy: Some(Sourced::new(guardian_extra_policy, source)),
             }
         );
     }
@@ -2841,6 +3039,7 @@ mod tests {
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                application: None,
                 permissions: None,
                 models: None,
                 guardian_policy_config: None,
@@ -2857,6 +3056,7 @@ mod tests {
         let populated_requirements: ConfigRequirementsToml = from_str(
             r#"
                 allowed_approval_policies = ["never"]
+                guardian_extra_policy = "Use the managed extra policy."
             "#,
         )?;
         populated_target.merge_unset_fields(existing_source.clone(), populated_requirements);
@@ -2864,6 +3064,7 @@ mod tests {
         let source: ConfigRequirementsToml = from_str(
             r#"
                 allowed_approval_policies = ["on-request"]
+                guardian_extra_policy = "Use the lower-priority extra policy."
             "#,
         )?;
         let source_location = RequirementSource::MdmManagedPreferences {
@@ -2877,7 +3078,7 @@ mod tests {
             ConfigRequirementsWithSources {
                 allowed_approval_policies: Some(Sourced::new(
                     vec![AskForApproval::Never],
-                    existing_source,
+                    existing_source.clone(),
                 )),
                 allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
@@ -2900,9 +3101,14 @@ mod tests {
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                application: None,
                 permissions: None,
                 models: None,
                 guardian_policy_config: None,
+                guardian_extra_policy: Some(Sourced::new(
+                    "Use the managed extra policy.".to_string(),
+                    existing_source,
+                )),
                 ..Default::default()
             }
         );
@@ -2916,29 +3122,35 @@ mod tests {
             RequirementSource::LegacyManagedConfigTomlFromMdm,
             ConfigRequirementsToml {
                 guardian_policy_config: Some("   \n\t".to_string()),
+                guardian_extra_policy: Some("   \n\t".to_string()),
                 ..Default::default()
             },
         );
+        let source = RequirementSource::SystemRequirementsToml {
+            file: system_requirements_toml_file_for_test().expect("system requirements.toml path"),
+        };
         target.merge_unset_fields(
-            RequirementSource::SystemRequirementsToml {
-                file: system_requirements_toml_file_for_test()
-                    .expect("system requirements.toml path"),
-            },
+            source.clone(),
             ConfigRequirementsToml {
                 guardian_policy_config: Some("Use the system guardian policy.".to_string()),
+                guardian_extra_policy: Some("Use the system extra policy.".to_string()),
                 ..Default::default()
             },
         );
 
         assert_eq!(
-            target.guardian_policy_config,
-            Some(Sourced::new(
-                "Use the system guardian policy.".to_string(),
-                RequirementSource::SystemRequirementsToml {
-                    file: system_requirements_toml_file_for_test()
-                        .expect("system requirements.toml path"),
-                },
-            )),
+            target,
+            ConfigRequirementsWithSources {
+                guardian_policy_config: Some(Sourced::new(
+                    "Use the system guardian policy.".to_string(),
+                    source.clone(),
+                )),
+                guardian_extra_policy: Some(Sourced::new(
+                    "Use the system extra policy.".to_string(),
+                    source,
+                )),
+                ..Default::default()
+            },
         );
     }
 
@@ -2949,27 +3161,36 @@ mod tests {
 guardian_policy_config = """
 Use the cloud-managed guardian policy.
 """
+guardian_extra_policy = """
+Use the cloud-managed extra policy.
+"""
 "#,
         )?;
 
         assert_eq!(
-            requirements.guardian_policy_config.as_deref(),
-            Some("Use the cloud-managed guardian policy.\n")
+            requirements,
+            ConfigRequirementsToml {
+                guardian_policy_config: Some(
+                    "Use the cloud-managed guardian policy.\n".to_string()
+                ),
+                guardian_extra_policy: Some("Use the cloud-managed extra policy.\n".to_string()),
+                ..Default::default()
+            }
         );
         Ok(())
     }
 
     #[test]
     fn blank_guardian_policy_config_is_empty() -> Result<()> {
-        let requirements: ConfigRequirementsToml = from_str(
-            r#"
-guardian_policy_config = """
+        for key in ["guardian_policy_config", "guardian_extra_policy"] {
+            let requirements: ConfigRequirementsToml =
+                from_str(&format!("{key} = \"\"\"\n\n\"\"\"\n"))?;
+            assert!(requirements.is_empty(), "{key}");
 
-"""
-"#,
-        )?;
-
-        assert!(requirements.is_empty());
+            let requirements: ConfigRequirementsToml =
+                from_str(&format!("{key} = \"Use the managed policy.\"\n"))?;
+            assert!(!requirements.is_empty(), "{key}");
+        }
         Ok(())
     }
 
@@ -3093,6 +3314,7 @@ allowed_approvals_reviewers = ["user"]
                                 "calendar/list_events".to_string(),
                                 AppToolRequirementToml {
                                     approval_mode: Some(AppToolApproval::Approve),
+                                    analytics_result_source: None,
                                 },
                             )]),
                         }),
@@ -3100,6 +3322,56 @@ allowed_approvals_reviewers = ["user"]
                 )]),
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn app_tool_result_source_requirements_parse_and_merge() -> Result<()> {
+        let rule = r#"
+            [apps.connector_123123.tools."messages/search"]
+            analytics_result_source = { format = "detailed_message_search_v1", type = "message_room" }
+            "#;
+        let requirements: ConfigRequirementsToml = from_str(rule)?;
+        assert!(!requirements.is_empty());
+        let source = requirements.apps.expect("apps should be present");
+
+        for higher_rule in [
+            None,
+            Some(("unsupported", "other_resource")),
+            Some(("detailed_message_search_v1", "other_resource")),
+        ] {
+            let mut merged = source.clone();
+            merged
+                .apps
+                .get_mut("connector_123123")
+                .expect("app should be present")
+                .tools
+                .as_mut()
+                .expect("tools should be present")
+                .tools
+                .get_mut("messages/search")
+                .expect("tool should be present")
+                .analytics_result_source = higher_rule.map(|(format, source_type)| {
+                from_str(&format!("format = {format:?}\ntype = {source_type:?}"))
+                    .expect("complete source rule should parse, including unknown formats")
+            });
+            let expected = if higher_rule.is_none() {
+                source.clone()
+            } else {
+                merged.clone()
+            };
+
+            merge_app_requirements_descending(&mut merged, source.clone());
+
+            assert_eq!(merged, expected);
+        }
+
+        for incomplete_rule in [
+            r#"format = "detailed_message_search_v1""#,
+            r#"type = "message_room""#,
+        ] {
+            assert!(from_str::<AppToolResultSourceRequirementToml>(incomplete_rule).is_err());
+        }
         Ok(())
     }
 
@@ -3135,6 +3407,7 @@ allowed_approvals_reviewers = ["user"]
                             tool_name.to_string(),
                             AppToolRequirementToml {
                                 approval_mode: Some(approval_mode),
+                                analytics_result_source: None,
                             },
                         )]),
                     }),
@@ -3552,7 +3825,29 @@ allowed_approvals_reviewers = ["user"]
                 .can_set(&Some(WindowsSandboxModeToml::Unelevated))
                 .is_err()
         );
+        assert!(
+            requirements
+                .windows_sandbox_mode
+                .can_set(&Some(WindowsSandboxModeToml::Mxc))
+                .is_ok()
+        );
         assert!(requirements.windows_sandbox_mode.can_set(&None).is_err());
+
+        for allow_mxc in [true, false] {
+            let config = from_str(&format!("{toml_str}\nallow_mxc = {allow_mxc}"))?;
+            let requirements: ConfigRequirements = with_unknown_source(config).try_into()?;
+            let constraint = &requirements.windows_sandbox_mode;
+            assert_eq!(
+                [
+                    Some(WindowsSandboxModeToml::Elevated),
+                    Some(WindowsSandboxModeToml::Unelevated),
+                    Some(WindowsSandboxModeToml::Mxc),
+                    None,
+                ]
+                .map(|mode| constraint.can_set(&mode).is_ok()),
+                [true, false, allow_mxc, false]
+            );
+        }
 
         Ok(())
     }
@@ -4132,6 +4427,14 @@ command = "python3 /enterprise/hooks/pre.py"
             [experimental_network.unix_sockets]
             "/tmp/example.sock" = "allow"
             "/tmp/blocked.sock" = "deny"
+
+            [[experimental_network.header_injections]]
+            host = "api.example.com"
+            methods = ["POST"]
+            path_prefixes = ["/console/v1"]
+
+            [experimental_network.header_injections.headers]
+            "x-statsig-change-source" = "codex"
         "#;
 
         let source = RequirementSource::LegacyManagedConfigTomlFromMdm;
@@ -4189,6 +4492,21 @@ command = "python3 /enterprise/hooks/pre.py"
             })
         );
         assert_eq!(sourced_network.value.allow_local_binding, Some(false));
+        assert_eq!(
+            sourced_network.value.header_injections,
+            Some(vec![NetworkHeaderInjectionToml {
+                host: "api.example.com".to_string(),
+                methods: vec!["POST".to_string()],
+                path_prefixes: vec!["/console/v1".to_string()],
+                headers: BTreeMap::from([(
+                    "x-statsig-change-source".to_string(),
+                    "codex".to_string(),
+                )]),
+            }])
+        );
+        let debug = format!("{:?}", sourced_network.value.header_injections);
+        assert!(debug.contains("x-statsig-change-source"));
+        assert!(!debug.contains("codex"));
 
         Ok(())
     }

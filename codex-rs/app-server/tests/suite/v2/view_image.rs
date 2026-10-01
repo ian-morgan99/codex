@@ -41,7 +41,7 @@ async fn fresh_context_subagent_inherits_disabled_view_image_and_mcp_tools() -> 
     const MCP_CALL_ID: &str = "call-child-mcp-with-disabled-view-image";
 
     let responses_server = responses::start_mock_server().await;
-    let (mcp_server_url, mcp_server_handle) = start_mcp_server().await?;
+    let (mcp_server_url, mcp_server_handle) = start_mcp_server(/*sensitive_action*/ None).await?;
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&responses_server.uri())
         .with_model("gpt-5.4")
@@ -50,7 +50,7 @@ async fn fresh_context_subagent_inherits_disabled_view_image_and_mcp_tools() -> 
             "[mcp_servers.{TEST_SERVER_NAME}]\nurl = \"{mcp_server_url}/mcp\"\n\n[features.multi_agent_v2]\nenabled = true"
         ))
         .write(codex_home.path())?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())

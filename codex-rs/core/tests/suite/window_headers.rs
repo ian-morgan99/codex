@@ -67,12 +67,10 @@ async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork(
 
     let forked = resumed
         .thread_manager
-        .fork_thread(
+        .fork_legacy_thread(
             /*snapshot*/ 0usize,
-            resumed.config.clone(),
+            codex_core::StartThreadOptions::new(resumed.config.clone()),
             rollout_path,
-            /*thread_source*/ None,
-            /*parent_trace*/ None,
         )
         .await?;
     submit_user_turn(&forked.thread, "after fork").await?;
@@ -128,6 +126,13 @@ async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork(
     assert_eq!(
         metadata[2]["context_window_id"],
         metadata[3]["context_window_id"]
+    );
+    assert_eq!(
+        metadata
+            .iter()
+            .map(|metadata| metadata["window_number"].as_u64())
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(0), Some(1), Some(1), Some(0)]
     );
 
     Ok(())

@@ -4,6 +4,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_config::test_support::CloudConfigBundleFixture;
 use codex_core::TurnInputRequest;
+use codex_exec_server::ExecParams;
+use codex_features::Feature;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -13,8 +15,11 @@ use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSandboxPolicyContext;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::permissions::ReadDenyMatcher;
+use codex_protocol::permissions::project_roots_glob_pattern;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::EventMsg;
@@ -34,6 +39,8 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
+use core_test_support::startup::STARTUP_TIMEOUT;
+use core_test_support::startup::expect_startup;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use futures::SinkExt;
@@ -42,6 +49,9 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use std::fs;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use test_case::test_case;
 use tokio::net::TcpListener;
@@ -62,8 +72,19 @@ const REPLAY_RETAINED_OUTPUT_SEQ: u64 = 800;
 #[cfg_attr(windows, allow(dead_code))]
 enum PushedExecScenario {
     Complete,
+    CodexPath,
+    CodexPathDefaultFeature,
+    CodexPathDisabledFeature,
+    CodexPathWithExplicitOverride,
+    UnusableCodexPath,
     DirectDenied,
+    DenyWin,
+    DenyWinUnchanged,
+    DenyOldLinux,
+    DenyOldLinuxWithRoot(FileSystemAccessMode),
+    DenyLinux,
     ElevatedPowerShell,
+    RejectedLongWindowsDangerousCommand,
     SandboxedInterceptedPatch,
     SandboxedDirectPatch,
     SandboxedDirectPatchDenied,
@@ -74,15 +95,25 @@ enum PushedExecScenario {
     ReplayGap,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedNetworkScenario {
+    None,
+    Enabled { policy_callbacks: bool },
+    Disabled,
+}
+
 #[derive(Debug)]
 struct PushedExecServerResult {
     process_read_requests: usize,
     process_start: Value,
 }
 
-async fn read_exec_server_json(websocket: &mut WebSocketStream<TcpStream>) -> Value {
+async fn read_exec_server_json(
+    websocket: &mut WebSocketStream<TcpStream>,
+    wait: Duration,
+) -> Value {
     loop {
-        match timeout(Duration::from_secs(5), websocket.next())
+        match timeout(wait, websocket.next())
             .await
             .expect("websocket read should not time out")
             .expect("websocket should stay open")
@@ -111,7 +142,7 @@ async fn accept_initialized_exec_server(listener: TcpListener) -> WebSocketStrea
     let (stream, _) = listener.accept().await.expect("connection");
     let mut websocket = accept_async(stream).await.expect("websocket handshake");
 
-    let initialize = read_exec_server_json(&mut websocket).await;
+    let initialize = read_exec_server_json(&mut websocket, Duration::from_secs(/*secs*/ 5)).await;
     assert_eq!(initialize["method"], "initialize");
     send_exec_server_json(
         &mut websocket,
@@ -121,7 +152,7 @@ async fn accept_initialized_exec_server(listener: TcpListener) -> WebSocketStrea
         }),
     )
     .await;
-    let initialized = read_exec_server_json(&mut websocket).await;
+    let initialized = read_exec_server_json(&mut websocket, Duration::from_secs(/*secs*/ 5)).await;
     assert_eq!(initialized["method"], "initialized");
 
     websocket
@@ -131,7 +162,7 @@ async fn send_environment_info(
     websocket: &mut WebSocketStream<TcpStream>,
     scenario: PushedExecScenario,
 ) {
-    let info = read_exec_server_json(websocket).await;
+    let info = read_exec_server_json(websocket, STARTUP_TIMEOUT).await;
     assert_eq!(info["method"], "environment/info");
     respond_environment_info(websocket, &info["id"], scenario).await;
 }
@@ -141,27 +172,65 @@ async fn respond_environment_info(
     id: &Value,
     scenario: PushedExecScenario,
 ) {
-    let shell = if matches!(scenario, PushedExecScenario::ElevatedPowerShell) {
+    let shell = if matches!(
+        scenario,
+        PushedExecScenario::DenyWin
+            | PushedExecScenario::DenyWinUnchanged
+            | PushedExecScenario::ElevatedPowerShell
+            | PushedExecScenario::RejectedLongWindowsDangerousCommand
+    ) {
         json!({ "name": "powershell", "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" })
     } else {
         json!({ "name": "zsh", "path": "/bin/zsh" })
     };
-    send_exec_server_json(
-        websocket,
-        json!({
-            "id": id,
-            "result": {
-                "shell": shell,
-                "capabilities": { "networkProxyLaunch": true }
-            }
-        }),
-    )
-    .await;
+    let platform_os = match scenario {
+        PushedExecScenario::DenyWin
+        | PushedExecScenario::DenyWinUnchanged
+        | PushedExecScenario::RejectedLongWindowsDangerousCommand => Some("windows"),
+        PushedExecScenario::DenyOldLinux
+        | PushedExecScenario::DenyOldLinuxWithRoot(_)
+        | PushedExecScenario::DenyLinux => Some("linux"),
+        _ => None,
+    };
+    let mut capabilities = json!({ "networkProxyLaunch": true });
+    if matches!(
+        scenario,
+        PushedExecScenario::DenyOldLinuxWithRoot(_) | PushedExecScenario::DenyLinux
+    ) {
+        capabilities["linuxRootWritePreservesDevices"] = json!(true);
+    }
+    if matches!(scenario, PushedExecScenario::DenyLinux) {
+        capabilities["linuxApprovedRootWritePreservesRestrictions"] = json!(true);
+    }
+    let mut response = json!({
+        "id": id,
+        "result": {
+            "shell": shell,
+            "platformOs": platform_os,
+            "capabilities": capabilities,
+        }
+    });
+    if matches!(
+        scenario,
+        PushedExecScenario::CodexPath
+            | PushedExecScenario::CodexPathDefaultFeature
+            | PushedExecScenario::CodexPathDisabledFeature
+            | PushedExecScenario::CodexPathWithExplicitOverride
+    ) {
+        response["result"]["prependPathDirs"] = json!([
+            "file:///executor/codex-path",
+            "file:///executor/extra-tools",
+        ]);
+    } else if matches!(scenario, PushedExecScenario::UnusableCodexPath) {
+        response["result"]["prependPathDirs"] = json!(["file:///executor/codex%3Apath"]);
+    }
+    send_exec_server_json(websocket, response).await;
 }
 
 async fn serve_exec_with_pushed_events(
     listener: TcpListener,
     scenario: PushedExecScenario,
+    process_started: Arc<AtomicBool>,
 ) -> PushedExecServerResult {
     let unrestricted_patch = matches!(
         scenario,
@@ -172,9 +241,13 @@ async fn serve_exec_with_pushed_events(
     send_environment_info(&mut websocket, scenario).await;
 
     let process_start = loop {
-        let request = read_exec_server_json(&mut websocket).await;
+        // The runtime may still be finishing local setup before its first tool call.
+        let request = read_exec_server_json(&mut websocket, STARTUP_TIMEOUT).await;
         match request["method"].as_str() {
-            Some("process/start") => break request,
+            Some("process/start") => {
+                process_started.store(true, Ordering::SeqCst);
+                break request;
+            }
             Some("environment/info") => {
                 respond_environment_info(&mut websocket, &request["id"], scenario).await;
             }
@@ -348,7 +421,18 @@ async fn serve_exec_with_pushed_events(
     .await;
 
     match scenario {
-        PushedExecScenario::Complete | PushedExecScenario::ElevatedPowerShell => {
+        PushedExecScenario::Complete
+        | PushedExecScenario::DenyWin
+        | PushedExecScenario::DenyWinUnchanged
+        | PushedExecScenario::DenyOldLinux
+        | PushedExecScenario::DenyOldLinuxWithRoot(_)
+        | PushedExecScenario::DenyLinux
+        | PushedExecScenario::CodexPath
+        | PushedExecScenario::CodexPathDefaultFeature
+        | PushedExecScenario::CodexPathDisabledFeature
+        | PushedExecScenario::CodexPathWithExplicitOverride
+        | PushedExecScenario::UnusableCodexPath
+        | PushedExecScenario::ElevatedPowerShell => {
             let encoded_output = BASE64_STANDARD.encode(COMPLETE_OUTPUT);
             for message in [
                 json!({
@@ -376,6 +460,9 @@ async fn serve_exec_with_pushed_events(
             ] {
                 send_exec_server_json(&mut websocket, message).await;
             }
+        }
+        PushedExecScenario::RejectedLongWindowsDangerousCommand => {
+            panic!("dangerous command must not reach the executor")
         }
         PushedExecScenario::DirectDenied => {
             send_exec_server_json(
@@ -421,12 +508,17 @@ async fn serve_exec_with_pushed_events(
 
     let mut process_read_requests = 0;
     loop {
-        let request = read_exec_server_json(&mut websocket).await;
+        let request = read_exec_server_json(&mut websocket, Duration::from_secs(/*secs*/ 5)).await;
         match request["method"].as_str() {
             Some("process/read") => {
                 process_read_requests += 1;
                 let result = match scenario {
-                    PushedExecScenario::Complete => json!({
+                    PushedExecScenario::Complete
+                    | PushedExecScenario::CodexPath
+                    | PushedExecScenario::CodexPathDefaultFeature
+                    | PushedExecScenario::CodexPathDisabledFeature
+                    | PushedExecScenario::CodexPathWithExplicitOverride
+                    | PushedExecScenario::UnusableCodexPath => json!({
                         "chunks": [{
                             "seq": 1,
                             "stream": "stdout",
@@ -448,8 +540,16 @@ async fn serve_exec_with_pushed_events(
                         "failure": null,
                         "sandboxDenied": true,
                     }),
-                    PushedExecScenario::ElevatedPowerShell => {
-                        panic!("elevated remote PowerShell must not read a remote process")
+                    PushedExecScenario::DenyWin
+                    | PushedExecScenario::DenyWinUnchanged
+                    | PushedExecScenario::DenyOldLinux
+                    | PushedExecScenario::DenyOldLinuxWithRoot(_)
+                    | PushedExecScenario::DenyLinux
+                    | PushedExecScenario::ElevatedPowerShell => {
+                        panic!("completed remote PowerShell must not read a remote process")
+                    }
+                    PushedExecScenario::RejectedLongWindowsDangerousCommand => {
+                        panic!("dangerous command must not read a remote process")
                     }
                     PushedExecScenario::SandboxedInterceptedPatch
                     | PushedExecScenario::SandboxedDirectPatch
@@ -532,36 +632,85 @@ async fn serve_exec_with_pushed_events(
     }
 }
 
-#[test_case(PushedExecScenario::Complete, false, false, false ; "complete_event_stream")]
-#[test_case(PushedExecScenario::DirectDenied, false, false, false ; "direct_sandbox_denial")]
-#[test_case(PushedExecScenario::LegacyExit, false, false, false ; "legacy_exit_metadata")]
-#[test_case(PushedExecScenario::ReplayGap, false, false, false ; "truncated_event_replay")]
-#[test_case(PushedExecScenario::Complete, true, true, false ; "managed_network_uses_executor_proxy_launch")]
-#[test_case(PushedExecScenario::Complete, true, false, false ; "strict_managed_allowlist_omits_policy_callbacks")]
-#[cfg_attr(not(windows), test_case(PushedExecScenario::Complete, true, true, true ; "foreign_windows_managed_network_preserves_approval_registration"))]
-#[cfg_attr(not(windows), test_case(PushedExecScenario::Complete, false, false, true ; "foreign_windows_workspace_sandbox"))]
-#[test_case(PushedExecScenario::ElevatedPowerShell, false, false, true ; "windows_elevated_powershell_disables_profile")]
-#[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedInterceptedPatch, false, false, true ; "foreign_windows_intercepted_patch_is_sandboxed"))]
-#[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedDirectPatch, false, false, true ; "foreign_windows_direct_patch_is_sandboxed"))]
-#[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedDirectPatchDenied, false, false, true ; "foreign_windows_direct_patch_denial_requests_approval"))]
-#[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedDirectPatchRetry, false, false, true ; "foreign_windows_direct_patch_denial_approval_retries_unsandboxed"))]
-#[cfg_attr(not(windows), test_case(PushedExecScenario::UnsandboxedInterceptedPatch, false, false, true ; "foreign_windows_unsandboxed_intercepted_patch_succeeds"))]
-#[cfg_attr(not(windows), test_case(PushedExecScenario::FullDiskInterceptedPatch, false, false, true ; "foreign_windows_full_disk_intercepted_patch_succeeds"))]
+#[test_case(PushedExecScenario::Complete, ManagedNetworkScenario::None, false ; "complete_event_stream")]
+#[test_case(PushedExecScenario::CodexPath, ManagedNetworkScenario::None, false ; "codex_path_is_exported_before_nested_command")]
+#[test_case(PushedExecScenario::CodexPathDefaultFeature, ManagedNetworkScenario::None, false ; "codex_path_is_not_exported_by_default")]
+#[test_case(PushedExecScenario::CodexPathDisabledFeature, ManagedNetworkScenario::None, false ; "disabled_codex_path_preserves_original_login_command")]
+#[test_case(PushedExecScenario::CodexPathWithExplicitOverride, ManagedNetworkScenario::None, false ; "explicit_path_override_preserves_original_login_command")]
+#[test_case(PushedExecScenario::UnusableCodexPath, ManagedNetworkScenario::None, false ; "unusable_codex_path_preserves_requested_login_shell")]
+#[test_case(PushedExecScenario::DirectDenied, ManagedNetworkScenario::None, false ; "direct_sandbox_denial")]
+#[test_case(PushedExecScenario::LegacyExit, ManagedNetworkScenario::None, false ; "legacy_exit_metadata")]
+#[test_case(PushedExecScenario::ReplayGap, ManagedNetworkScenario::None, false ; "truncated_event_replay")]
+#[test_case(PushedExecScenario::Complete, ManagedNetworkScenario::Enabled { policy_callbacks: true }, false ; "managed_network_uses_executor_proxy_launch")]
+#[test_case(PushedExecScenario::Complete, ManagedNetworkScenario::Enabled { policy_callbacks: false }, false ; "strict_managed_allowlist_omits_policy_callbacks")]
+#[test_case(PushedExecScenario::Complete, ManagedNetworkScenario::Disabled, false ; "disabled_managed_network_omits_executor_proxy_launch")]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::Complete, ManagedNetworkScenario::Enabled { policy_callbacks: true }, true ; "foreign_windows_managed_network_preserves_approval_registration"))]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::Complete, ManagedNetworkScenario::None, true ; "foreign_windows_workspace_sandbox"))]
+#[test_case(PushedExecScenario::DenyWin, ManagedNetworkScenario::None, true ; "old_windows_deny_read_allows_approved_escalation")]
+#[test_case(PushedExecScenario::DenyWinUnchanged, ManagedNetworkScenario::None, true ; "old_windows_deny_read_keeps_unmaterializable_policy_unchanged")]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::DenyOldLinux, ManagedNetworkScenario::None, false ; "old_linux_deny_read_rejects_approved_escalation"))]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::DenyOldLinuxWithRoot(FileSystemAccessMode::Deny), ManagedNetworkScenario::None, false ; "old_linux_deny_read_keeps_root_deny_unchanged"))]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::DenyOldLinuxWithRoot(FileSystemAccessMode::Write), ManagedNetworkScenario::None, false ; "device_only_linux_deny_read_rejects_unchanged_writable_root_metadata"))]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::DenyLinux, ManagedNetworkScenario::None, false ; "linux_deny_read_allows_approved_escalation"))]
+#[test_case(PushedExecScenario::ElevatedPowerShell, ManagedNetworkScenario::None, true ; "windows_elevated_powershell_disables_profile")]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::RejectedLongWindowsDangerousCommand, ManagedNetworkScenario::None, true ; "remote_windows_dangerous_command_rejection_is_bounded"))]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedInterceptedPatch, ManagedNetworkScenario::None, true ; "foreign_windows_intercepted_patch_is_sandboxed"))]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedDirectPatch, ManagedNetworkScenario::None, true ; "foreign_windows_direct_patch_is_sandboxed"))]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedDirectPatchDenied, ManagedNetworkScenario::None, true ; "foreign_windows_direct_patch_denial_requests_approval"))]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedDirectPatchRetry, ManagedNetworkScenario::None, true ; "foreign_windows_direct_patch_denial_approval_retries_unsandboxed"))]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::UnsandboxedInterceptedPatch, ManagedNetworkScenario::None, true ; "foreign_windows_unsandboxed_intercepted_patch_succeeds"))]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::FullDiskInterceptedPatch, ManagedNetworkScenario::None, true ; "foreign_windows_full_disk_intercepted_patch_succeeds"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_command_consumes_pushed_remote_process_events(
     scenario: PushedExecScenario,
-    managed_network: bool,
-    policy_callbacks: bool,
+    managed_network: ManagedNetworkScenario,
     foreign_cwd: bool,
 ) -> Result<()> {
+    let explicit_path = "/user/configured/bin:/user/other/bin";
+    let managed_network_configured = !matches!(managed_network, ManagedNetworkScenario::None);
+    let managed_network_enabled = matches!(managed_network, ManagedNetworkScenario::Enabled { .. });
+    let policy_callbacks = matches!(
+        managed_network,
+        ManagedNetworkScenario::Enabled {
+            policy_callbacks: true
+        }
+    );
+    let deny_read = matches!(
+        scenario,
+        PushedExecScenario::DenyWin
+            | PushedExecScenario::DenyWinUnchanged
+            | PushedExecScenario::DenyOldLinux
+            | PushedExecScenario::DenyOldLinuxWithRoot(_)
+            | PushedExecScenario::DenyLinux
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server = start_mock_server().await;
     let tool_call = match scenario {
+        _ if deny_read => ev_function_call(
+            CALL_ID,
+            "exec_command",
+            &json!({
+                "cmd": "codex-deny-read-escalation-test",
+                "sandbox_permissions": "require_escalated",
+                "justification": "Can I run outside the workspace?",
+            })
+            .to_string(),
+        ),
         PushedExecScenario::SandboxedDirectPatch
         | PushedExecScenario::SandboxedDirectPatchDenied
         | PushedExecScenario::SandboxedDirectPatchRetry => ev_apply_patch_custom_tool_call(
             CALL_ID,
             "*** Begin Patch\n*** Update File: secret.txt\n@@\n-old\n+new\n*** End Patch",
+        ),
+        PushedExecScenario::CodexPathWithExplicitOverride | PushedExecScenario::UnusableCodexPath => ev_function_call(
+            CALL_ID,
+            "exec_command",
+            &json!({
+                "cmd": "sh -c 'command -v rg'",
+                "login": true,
+                "yield_time_ms": 1_000,
+            })
+            .to_string(),
         ),
         _ => ev_function_call(
             CALL_ID,
@@ -569,13 +718,20 @@ async fn exec_command_consumes_pushed_remote_process_events(
             &json!({
                 "cmd": match scenario {
                     PushedExecScenario::SandboxedInterceptedPatch => {
-                        "apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: secret.txt\n@@\n-old\n+new\n*** End Patch\nPATCH"
+                        "apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: secret.txt\n@@\n-old\n+new\n*** End Patch\nPATCH".to_string()
                     }
                     PushedExecScenario::UnsandboxedInterceptedPatch
                     | PushedExecScenario::FullDiskInterceptedPatch => {
-                        "apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: allowed.txt\n+allowed\n*** End Patch\nPATCH"
+                        "apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: allowed.txt\n+allowed\n*** End Patch\nPATCH".to_string()
                     }
-                    _ => "pwd",
+                    PushedExecScenario::RejectedLongWindowsDangerousCommand => format!(
+                        "Remove-Item test -Force; {}",
+                        "Write-Output filler; ".repeat(2_000)
+                    ),
+                    PushedExecScenario::CodexPath
+                    | PushedExecScenario::CodexPathDefaultFeature
+                    | PushedExecScenario::CodexPathDisabledFeature => "sh -c 'command -v rg'".to_string(),
+                    _ => "pwd".to_string(),
                 },
                 "yield_time_ms": 1_000,
             })
@@ -599,13 +755,21 @@ async fn exec_command_consumes_pushed_remote_process_events(
     )
     .await;
     let exec_server_url = format!("ws://{}", listener.local_addr()?);
-    let exec_server = tokio::spawn(serve_exec_with_pushed_events(listener, scenario));
+    let process_started = Arc::new(AtomicBool::new(false));
+    let exec_server = tokio::spawn(serve_exec_with_pushed_events(
+        listener,
+        scenario,
+        Arc::clone(&process_started),
+    ));
     let mut builder = test_codex().with_exec_server_url(exec_server_url);
-    if managed_network {
-        let cloud_config_bundle = if policy_callbacks {
-            managed_network_requirements_loader()
-        } else {
-            CloudConfigBundleFixture::loader_with_enterprise_requirement(
+    if managed_network_configured {
+        let cloud_config_bundle = match managed_network {
+            ManagedNetworkScenario::Enabled {
+                policy_callbacks: true,
+            } => managed_network_requirements_loader(),
+            ManagedNetworkScenario::Enabled {
+                policy_callbacks: false,
+            } => CloudConfigBundleFixture::loader_with_enterprise_requirement(
                 r#"
 [experimental_network]
 enabled = true
@@ -615,7 +779,16 @@ managed_allowed_domains_only = true
 [experimental_network.domains]
 "allowed.example.com" = "allow"
 "#,
-            )
+            ),
+            ManagedNetworkScenario::Disabled => {
+                CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                    r#"
+[experimental_network]
+enabled = false
+"#,
+                )
+            }
+            ManagedNetworkScenario::None => unreachable!("managed network is not configured"),
         };
         builder = builder
             .with_cloud_config_bundle(cloud_config_bundle)
@@ -650,22 +823,78 @@ timeout = 900
     }
     let mut builder = builder.with_config(move |config| {
         config.project_doc_max_bytes = 0;
-        if matches!(scenario, PushedExecScenario::ElevatedPowerShell) {
+        if matches!(scenario, PushedExecScenario::CodexPathDisabledFeature) {
+            config
+                .features
+                .disable(Feature::LoginShellPackagePath)
+                .expect("disable login shell package PATH");
+        } else if !matches!(scenario, PushedExecScenario::CodexPathDefaultFeature) {
+            config
+                .features
+                .enable(Feature::LoginShellPackagePath)
+                .expect("enable login shell package PATH");
+        }
+        if matches!(scenario, PushedExecScenario::CodexPathWithExplicitOverride) {
+            config
+                .permissions
+                .shell_environment_policy
+                .r#set
+                .insert("PATH".to_string(), explicit_path.to_string());
+        }
+        if matches!(scenario, PushedExecScenario::ElevatedPowerShell) || (foreign_cwd && deny_read)
+        {
             config.set_windows_elevated_sandbox_enabled(/*value*/ true);
         }
-        if managed_network {
+        if managed_network_configured {
             #[cfg(windows)]
             config.set_windows_sandbox_enabled(/*value*/ true);
             config.approvals_reviewer = ApprovalsReviewer::AutoReview;
             config.bypass_hook_trust = true;
         }
     });
-    let test = timeout(Duration::from_secs(5), builder.build(&server))
-        .await
-        .context("thread startup should connect to the fake exec-server")??;
+    let test = expect_startup(builder.build(&server)).await;
 
-    let turn_permission_profile = if managed_network {
+    let turn_permission_profile = if managed_network_configured {
         test.session_configured.permission_profile.clone()
+    } else if deny_read {
+        let mut filesystem = FileSystemSandboxPolicy::read_only();
+        if let PushedExecScenario::DenyOldLinuxWithRoot(access) = scenario {
+            filesystem.entries[0].access = access;
+        }
+        filesystem.entries.extend(
+            [
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::project_roots(Some("secret.txt".into())),
+                },
+                FileSystemPath::GlobPattern {
+                    pattern: project_roots_glob_pattern("*.token".as_ref()),
+                },
+            ]
+            .map(|path| FileSystemSandboxEntry::new(path, FileSystemAccessMode::Deny)),
+        );
+        if matches!(scenario, PushedExecScenario::DenyWinUnchanged) {
+            filesystem.entries.push(FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Tmpdir,
+                },
+                FileSystemAccessMode::Deny,
+            ));
+        }
+        if matches!(
+            scenario,
+            PushedExecScenario::DenyOldLinuxWithRoot(FileSystemAccessMode::Write)
+        ) {
+            let cwd = PathUri::parse("file:///workspace")?;
+            let context = FileSystemSandboxPolicyContext {
+                cwd: &cwd,
+                workspace_roots: std::slice::from_ref(&cwd),
+                user_home_dir: None,
+                temporary_directories: None,
+            };
+            filesystem = filesystem.for_approved_command(&context);
+            assert_eq!(filesystem.for_approved_command(&context), filesystem);
+        }
+        PermissionProfile::from_runtime_permissions(&filesystem, NetworkSandboxPolicy::Enabled)
     } else if matches!(scenario, PushedExecScenario::FullDiskInterceptedPatch) {
         PermissionProfile::from_runtime_permissions(
             &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry::new(
@@ -676,13 +905,35 @@ timeout = 900
             )]),
             NetworkSandboxPolicy::Enabled,
         )
+    } else if foreign_cwd
+        && matches!(
+            scenario,
+            PushedExecScenario::Complete | PushedExecScenario::ElevatedPowerShell
+        )
+    {
+        let mut file_system = PermissionProfile::workspace_write().file_system_sandbox_policy();
+        file_system.entries.extend([
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Path {
+                    path: "file:///C:/workspace/blocked".parse()?,
+                },
+                FileSystemAccessMode::Deny,
+            ),
+            FileSystemSandboxEntry::new(
+                FileSystemPath::GlobPattern {
+                    pattern: r"C:\workspace\private\**".into(),
+                },
+                FileSystemAccessMode::Deny,
+            ),
+        ]);
+        PermissionProfile::from_runtime_permissions(&file_system, NetworkSandboxPolicy::Restricted)
     } else if foreign_cwd && !matches!(scenario, PushedExecScenario::UnsandboxedInterceptedPatch) {
         PermissionProfile::workspace_write()
     } else {
         PermissionProfile::Disabled
     };
     let (sandbox_policy, permission_profile) =
-        turn_permission_fields(turn_permission_profile, test.config.cwd.as_path());
+        turn_permission_fields(turn_permission_profile.clone(), test.config.cwd.as_path());
     test.codex
         .start_or_steer_turn(
             TurnInputRequest::user_input(vec![UserInput::Text {
@@ -690,29 +941,38 @@ timeout = 900
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: foreign_cwd.then(|| {
-                    let cwd = PathUri::parse("file:///C:/workspace").expect("valid Windows cwd");
+                environments: (foreign_cwd || deny_read).then(|| {
+                    let cwd = PathUri::parse(if foreign_cwd {
+                        "file:///C:/workspace"
+                    } else {
+                        "file:///workspace"
+                    })
+                    .expect("valid executor cwd");
+                    let mut workspace_roots = vec![cwd.clone()];
+                    if foreign_cwd {
+                        workspace_roots.push(
+                            PathUri::parse("file:///D:/other-workspace")
+                                .expect("valid Windows workspace root"),
+                        );
+                    }
                     TurnEnvironmentSelections::new(
                         test.config.cwd.clone(),
                         vec![TurnEnvironmentSelection {
                             environment_id: codex_exec_server::REMOTE_ENVIRONMENT_ID.to_string(),
-                            cwd: cwd.clone(),
-                            workspace_roots: vec![
-                                cwd,
-                                PathUri::parse("file:///D:/other-workspace")
-                                    .expect("valid Windows workspace root"),
-                            ],
+                            cwd,
+                            workspace_roots,
                             config: EnvironmentConfigState::FromThread,
                         }],
                     )
                 }),
                 approval_policy: Some(
-                    if managed_network
+                    if managed_network_configured
                         || matches!(
                             scenario,
                             PushedExecScenario::SandboxedDirectPatchDenied
                                 | PushedExecScenario::SandboxedDirectPatchRetry
                         )
+                        || deny_read
                     {
                         AskForApproval::OnRequest
                     } else {
@@ -734,8 +994,9 @@ timeout = 900
         )
         .await?;
     let mut saw_exec_command_begin = false;
+    let mut exec_command_begin_command = None;
     let mut saw_patch_denial_approval = false;
-    if !managed_network {
+    if !managed_network_enabled {
         loop {
             let event = timeout(Duration::from_secs(5), test.codex.next_event())
                 .await
@@ -744,6 +1005,17 @@ timeout = 900
             match event {
                 EventMsg::ExecCommandBegin(event) if event.call_id == CALL_ID => {
                     saw_exec_command_begin = true;
+                    exec_command_begin_command = Some(event.command);
+                }
+                EventMsg::ExecApprovalRequest(approval) if deny_read => {
+                    assert_eq!(approval.call_id, CALL_ID);
+                    test.codex
+                        .submit(Op::ExecApproval {
+                            id: approval.effective_approval_id(),
+                            turn_id: None,
+                            decision: ReviewDecision::Approved,
+                        })
+                        .await?;
                 }
                 EventMsg::ApplyPatchApprovalRequest(approval)
                     if matches!(
@@ -773,6 +1045,41 @@ timeout = 900
                 _ => {}
             }
         }
+    }
+    if matches!(
+        scenario,
+        PushedExecScenario::DenyOldLinux
+            | PushedExecScenario::DenyOldLinuxWithRoot(FileSystemAccessMode::Write)
+    ) {
+        let request = response_mock.last_request().context("upgrade response")?;
+        let (output, _) = request
+            .function_call_output_content_and_success(CALL_ID)
+            .context("upgrade output")?;
+        assert!(
+            output
+                .expect("upgrade rejection should include output")
+                .contains("upgrade the exec-server")
+        );
+        assert!(!process_started.load(Ordering::SeqCst));
+        exec_server.abort();
+        return Ok(());
+    }
+    if matches!(
+        scenario,
+        PushedExecScenario::RejectedLongWindowsDangerousCommand
+    ) {
+        let request = response_mock
+            .last_request()
+            .context("model should receive the dangerous-command rejection")?;
+        let (output, success) = request
+            .function_call_output_content_and_success(CALL_ID)
+            .context("dangerous-command rejection should be model visible")?;
+        assert_ne!(success, Some(true));
+        let output = output.context("dangerous-command rejection should contain text")?;
+        assert!(output.len() < 1_000);
+        assert!(output.contains("chars truncated"));
+        exec_server.abort();
+        return Ok(());
     }
     if matches!(
         scenario,
@@ -891,7 +1198,7 @@ timeout = 900
         );
         return Ok(());
     }
-    let cleanup_timeout = if managed_network {
+    let cleanup_timeout = if managed_network_enabled {
         Duration::from_secs(15)
     } else {
         Duration::from_secs(5)
@@ -899,6 +1206,80 @@ timeout = 900
     let exec_server_result = timeout(cleanup_timeout, exec_server)
         .await
         .context("fake exec-server should observe process cleanup")??;
+    assert_eq!(
+        exec_server_result.process_start["params"]["metadata"],
+        json!({
+            "threadId": test.session_configured.thread_id,
+            "toolCallId": CALL_ID,
+        }),
+    );
+    if foreign_cwd && !managed_network_configured && !deny_read {
+        let permissions = response_mock.requests()[0]
+            .message_input_texts("developer")
+            .join("\n")
+            .lines()
+            .filter(|line| {
+                line.contains("`sandbox_mode`")
+                    || line.starts_with(" The writable root")
+                    || line.starts_with("- path `")
+                    || line.starts_with("- glob `")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        insta::allow_duplicates! {
+            insta::assert_snapshot!(permissions, @r#"
+            Filesystem sandboxing defines which files can be read or written. `sandbox_mode` is `workspace-write`: The sandbox permits reading files, and editing files in `cwd` and `writable_roots`. Editing files in other directories requires approval. Network access is restricted.
+             The writable roots are `C:\workspace`, `D:\other-workspace`.
+            - path `C:\workspace\blocked`
+            - glob `C:\workspace\private\**`
+            "#);
+        }
+    }
+    if matches!(scenario, PushedExecScenario::CodexPath) {
+        let argv = &exec_server_result.process_start["params"]["argv"];
+        assert_eq!(argv[0], "/bin/zsh");
+        assert_eq!(argv[1], "-lc");
+        let script = argv[2]
+            .as_str()
+            .context("shell command should contain a script")?;
+        assert!(script.contains("export PATH=/executor/codex-path"));
+        assert!(script.contains("export PATH=/executor/extra-tools"));
+        assert!(script.ends_with("; sh -c 'command -v rg'"));
+        assert_eq!(script.lines().count(), 1);
+        assert_eq!(
+            exec_command_begin_command,
+            Some(vec![
+                "/bin/zsh".to_string(),
+                "-lc".to_string(),
+                "sh -c 'command -v rg'".to_string()
+            ])
+        );
+    } else if matches!(
+        scenario,
+        PushedExecScenario::CodexPathDefaultFeature
+            | PushedExecScenario::CodexPathDisabledFeature
+            | PushedExecScenario::CodexPathWithExplicitOverride
+            | PushedExecScenario::UnusableCodexPath
+    ) {
+        let params = &exec_server_result.process_start["params"];
+        let expected = vec!["/bin/zsh", "-lc", "sh -c 'command -v rg'"];
+        assert_eq!(params["argv"], json!(expected));
+        assert_eq!(
+            exec_command_begin_command,
+            Some(expected.into_iter().map(str::to_string).collect())
+        );
+        if matches!(scenario, PushedExecScenario::CodexPathWithExplicitOverride) {
+            assert_eq!(params["envPolicy"]["set"]["PATH"], explicit_path);
+        }
+    } else if matches!(scenario, PushedExecScenario::Complete)
+        && !foreign_cwd
+        && !managed_network_configured
+    {
+        assert_eq!(
+            exec_server_result.process_start["params"]["argv"],
+            json!(["/bin/zsh", "-lc", "pwd"])
+        );
+    }
     if foreign_cwd {
         let params = &exec_server_result.process_start["params"];
         assert_eq!(params["cwd"], "file:///C:/workspace");
@@ -915,11 +1296,41 @@ timeout = 900
                     .is_some_and(|argv| argv.iter().any(|arg| arg == "-NoProfile")),
                 "elevated remote PowerShell must not load a user profile"
             );
+        } else if deny_read {
+            assert_eq!(params["sandbox"]["windowsSandboxLevel"], "elevated");
         } else {
             assert_eq!(params["sandbox"]["windowsSandboxLevel"], "restricted-token");
         }
     }
-    if managed_network {
+    if deny_read {
+        let params = &exec_server_result.process_start["params"];
+        let params: ExecParams = serde_json::from_value(params.clone())?;
+        let sandbox = params.sandbox.context("sandbox with denied reads")?;
+        let context = sandbox.policy_context();
+        let policy = sandbox.permissions.file_system_sandbox_policy();
+        let policy = policy.materialize_project_roots_with_path_uris(context.workspace_roots);
+        if matches!(
+            scenario,
+            PushedExecScenario::DenyWinUnchanged | PushedExecScenario::DenyOldLinuxWithRoot(_)
+        ) {
+            let baseline = turn_permission_profile.file_system_sandbox_policy();
+            assert_eq!(
+                policy,
+                baseline.materialize_project_roots_with_path_uris(context.workspace_roots)
+            );
+            assert!(!policy.can_write_path(&context.cwd.join("../outside")?, &context));
+        } else {
+            let matcher =
+                ReadDenyMatcher::from_context(&policy, &context).context("denied reads")?;
+            assert!(policy.can_write_path(&context.cwd.join("../outside")?, &context));
+            for root in context.workspace_roots {
+                for path in ["secret.txt", "private.token"] {
+                    assert!(matcher.is_read_denied_uri(&root.join(path)?, &context));
+                }
+            }
+        }
+    }
+    if managed_network_enabled {
         let params = &exec_server_result.process_start["params"];
         assert_eq!(params["enforceManagedNetwork"], true);
         assert_eq!(params["managedNetwork"], Value::Null);
@@ -941,6 +1352,13 @@ timeout = 900
         .context("model should receive the remote exec output")?;
         return Ok(());
     }
+    if matches!(managed_network, ManagedNetworkScenario::Disabled) {
+        let params = &exec_server_result.process_start["params"];
+        assert_eq!(params["enforceManagedNetwork"], false);
+        assert_eq!(params["managedNetwork"], Value::Null);
+        assert_eq!(params["networkProxy"], Value::Null);
+        assert_eq!(params["env"]["HTTP_PROXY"], Value::Null);
+    }
     let request = response_mock
         .last_request()
         .context("model should receive the exec_command output")?;
@@ -950,12 +1368,26 @@ timeout = 900
     let output = output.context("exec_command output should contain text")?;
     let process_read_requests = exec_server_result.process_read_requests;
     match scenario {
-        PushedExecScenario::Complete | PushedExecScenario::ElevatedPowerShell => {
+        PushedExecScenario::Complete
+        | PushedExecScenario::DenyWin
+        | PushedExecScenario::DenyWinUnchanged
+        | PushedExecScenario::DenyOldLinux
+        | PushedExecScenario::DenyOldLinuxWithRoot(_)
+        | PushedExecScenario::DenyLinux
+        | PushedExecScenario::CodexPath
+        | PushedExecScenario::CodexPathDefaultFeature
+        | PushedExecScenario::CodexPathDisabledFeature
+        | PushedExecScenario::CodexPathWithExplicitOverride
+        | PushedExecScenario::UnusableCodexPath
+        | PushedExecScenario::ElevatedPowerShell => {
             assert_ne!(success, Some(false));
             assert!(saw_exec_command_begin);
             assert!(output.contains("Process exited with code 0"));
             assert!(output.contains(COMPLETE_OUTPUT));
             assert_eq!(process_read_requests, 0, "unexpected compatibility read");
+        }
+        PushedExecScenario::RejectedLongWindowsDangerousCommand => {
+            unreachable!("dangerous command returned early")
         }
         PushedExecScenario::DirectDenied => {
             assert!(!saw_exec_command_begin);
@@ -988,3 +1420,6 @@ timeout = 900
 
     Ok(())
 }
+
+#[path = "network_approval_completion.rs"]
+mod network_approval_completion;

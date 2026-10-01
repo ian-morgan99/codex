@@ -31,10 +31,7 @@ pub fn append_error_log(message: impl AsRef<str>) {
 /// - trims trailing '/'
 /// - appends '/backend-api' for ChatGPT hosts when missing
 pub fn normalize_base_url(input: &str) -> String {
-    let mut base_url = input.to_string();
-    while base_url.ends_with('/') {
-        base_url.pop();
-    }
+    let mut base_url = input.trim_end_matches('/').to_string();
     if (base_url.starts_with("https://chatgpt.com")
         || base_url.starts_with("https://chat.openai.com"))
         && !base_url.contains("/backend-api")
@@ -42,6 +39,41 @@ pub fn normalize_base_url(input: &str) -> String {
         base_url = format!("{base_url}/backend-api");
     }
     base_url
+}
+
+/// Validate the destination before loading saved ChatGPT credentials, including in mock mode:
+/// environment discovery still makes authenticated HTTP requests when the task backend is mocked.
+pub(crate) fn validate_chatgpt_base_url(input: &str) -> anyhow::Result<String> {
+    let invalid_url = || {
+        anyhow::anyhow!(
+            "CODEX_CLOUD_TASKS_BASE_URL must use a trusted HTTPS origin on port 443, without user information, a query, or a fragment; custom backends cannot use saved ChatGPT credentials"
+        )
+    };
+    let uri = input.parse::<http::Uri>().map_err(|_| invalid_url())?;
+    let authority = uri
+        .authority()
+        .ok_or_else(invalid_url)?
+        .as_str()
+        .to_ascii_lowercase();
+    if uri.scheme_str() != Some("https")
+        || !matches!(
+            authority.as_str(),
+            "chatgpt.com"
+                | "chatgpt.com:443"
+                | "chat.openai.com"
+                | "chat.openai.com:443"
+                | "chatgpt-staging.com"
+                | "chatgpt-staging.com:443"
+        )
+        || uri.query().is_some()
+        || input.contains('#')
+    {
+        return Err(invalid_url());
+    }
+    Ok(normalize_base_url(&format!(
+        "https://{authority}{}",
+        uri.path()
+    )))
 }
 
 pub async fn load_auth_manager(
@@ -135,4 +167,37 @@ pub fn format_relative_time(reference: DateTime<Utc>, ts: DateTime<Utc>) -> Stri
 
 pub fn format_relative_time_now(ts: DateTime<Utc>) -> String {
     format_relative_time(Utc::now(), ts)
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::normalize_base_url;
+
+    #[test]
+    fn normalize_base_url_normalizes_urls() {
+        for (input, expected) in [
+            ("https://example.com/path", "https://example.com/path"),
+            ("https://example.com/path/", "https://example.com/path"),
+            ("https://example.com/path///", "https://example.com/path"),
+            ("", ""),
+            ("///", ""),
+            ("https://chatgpt.com///", "https://chatgpt.com/backend-api"),
+            (
+                "https://chatgpt.com/backend-api///",
+                "https://chatgpt.com/backend-api",
+            ),
+            (
+                "https://chat.openai.com///",
+                "https://chat.openai.com/backend-api",
+            ),
+            (
+                "https://chat.openai.com/backend-api///",
+                "https://chat.openai.com/backend-api",
+            ),
+        ] {
+            assert_eq!(normalize_base_url(input), expected, "input: {input:?}");
+        }
+    }
 }

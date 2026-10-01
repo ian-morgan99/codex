@@ -77,6 +77,7 @@ pub(super) struct PendingAppServerRequests {
     permissions_approvals: HashMap<(String, String), AppServerRequestId>,
     user_inputs: HashMap<String, VecDeque<PendingUserInputRequest>>,
     mcp_requests: HashMap<McpRequestKey, AppServerRequestId>,
+    pub(super) user_verification: super::user_verification_requests::UserVerificationRequests,
 }
 
 impl PendingAppServerRequests {
@@ -92,6 +93,16 @@ impl PendingAppServerRequests {
         self.permissions_approvals.clear();
         self.user_inputs.clear();
         self.mcp_requests.clear();
+        self.user_verification.clear();
+    }
+
+    pub(super) fn cancel_thread_verification(&mut self, thread_id: &str) {
+        for (server_name, request_id) in self.user_verification.cancel_thread(thread_id) {
+            self.mcp_requests.remove(&McpRequestKey {
+                server_name,
+                request_id,
+            });
+        }
     }
 
     pub(super) fn note_server_request(
@@ -153,6 +164,7 @@ impl PendingAppServerRequests {
                 None
             }
             ServerRequest::McpServerElicitationRequest { request_id, params } => {
+                self.user_verification.note_request(request_id, params);
                 self.mcp_requests.insert(
                     McpRequestKey {
                         server_name: params.server_name.clone(),
@@ -162,12 +174,7 @@ impl PendingAppServerRequests {
                 );
                 None
             }
-            ServerRequest::DynamicToolCall { request_id, .. } => {
-                Some(UnsupportedAppServerRequest {
-                    request_id: request_id.clone(),
-                    message: "Dynamic tool calls are not available in TUI yet.".to_string(),
-                })
-            }
+            ServerRequest::DynamicToolCall { .. } => None,
             ServerRequest::ChatgptAuthTokensRefresh { .. } => None,
             ServerRequest::AttestationGenerate { request_id, .. } => {
                 Some(UnsupportedAppServerRequest {
@@ -207,7 +214,43 @@ impl PendingAppServerRequests {
         T: Into<AppCommand>,
     {
         let thread_id = Self::canonical_thread_id(thread_id);
-        let op: AppCommand = op.into();
+        let op: AppCommand = match op.into() {
+            AppCommand::ResolveUserVerification {
+                server_name,
+                request_id,
+                response,
+            } => {
+                let (decision, content) = match response {
+                    crate::app_command::UserVerificationResponse::Accept { proof } => (
+                        codex_app_server_protocol::McpServerElicitationAction::Accept,
+                        Some(
+                            serde_json::to_value(proof)
+                                .map_err(|_| "Invalid verification proof".to_string())?,
+                        ),
+                    ),
+                    crate::app_command::UserVerificationResponse::Cancel => (
+                        codex_app_server_protocol::McpServerElicitationAction::Cancel,
+                        None,
+                    ),
+                };
+                AppCommand::ResolveElicitation {
+                    server_name,
+                    request_id,
+                    decision,
+                    content,
+                    meta: None,
+                }
+            }
+            op => op,
+        };
+        if let AppCommand::ResolveElicitation {
+            server_name,
+            request_id,
+            ..
+        } = &op
+        {
+            self.user_verification.remove(server_name, request_id);
+        }
         let resolution = match &op {
             AppCommand::ExecApproval { id, decision, .. } => self
                 .exec_approvals
@@ -350,6 +393,8 @@ impl PendingAppServerRequests {
             .find_map(|(key, value)| (value == request_id).then(|| key.clone()))
         {
             self.mcp_requests.remove(&key);
+            self.user_verification
+                .remove(&key.server_name, &key.request_id);
             return Some(ResolvedAppServerRequest::McpElicitation {
                 server_name: key.server_name,
                 request_id: key.request_id,
@@ -483,6 +528,7 @@ mod tests {
         let request = ServerRequest::CommandExecutionRequestApproval {
             request_id: AppServerRequestId::Integer(41),
             params: CommandExecutionRequestApprovalParams {
+                kind: Default::default(),
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
                 item_id: "call-1".to_string(),
@@ -630,7 +676,7 @@ mod tests {
                     item_id: "perm-1".to_string(),
                     environment_id: None,
                     started_at_ms: 0,
-                    cwd,
+                    cwd: cwd.into(),
                     reason: None,
                     permissions,
                 },
@@ -670,7 +716,7 @@ mod tests {
                     item_id: "perm-1".to_string(),
                     environment_id: None,
                     started_at_ms: 0,
-                    cwd: absolute_path(if cfg!(windows) { r"C:\tmp" } else { "/tmp" }),
+                    cwd: absolute_path(if cfg!(windows) { r"C:\tmp" } else { "/tmp" }).into(),
                     reason: None,
                     permissions: serde_json::from_value(json!({
                         "network": { "enabled": null }
@@ -837,32 +883,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_dynamic_tool_calls_as_unsupported() {
-        let mut pending = PendingAppServerRequests::default();
-        let request = ServerRequest::DynamicToolCall {
-            request_id: AppServerRequestId::Integer(99),
-            params: codex_app_server_protocol::DynamicToolCallParams {
-                thread_id: "thread-1".to_string(),
-                turn_id: "turn-1".to_string(),
-                call_id: "tool-1".to_string(),
-                namespace: None,
-                tool: "tool".to_string(),
-                arguments: json!({}),
-            },
-        };
-        assert!(!pending.contains_server_request(&request));
-        let unsupported = pending
-            .note_server_request(&request)
-            .expect("dynamic tool calls should be rejected");
-
-        assert_eq!(unsupported.request_id, AppServerRequestId::Integer(99));
-        assert_eq!(
-            unsupported.message,
-            "Dynamic tool calls are not available in TUI yet."
-        );
-    }
-
-    #[test]
     fn does_not_mark_chatgpt_auth_refresh_as_unsupported() {
         let mut pending = PendingAppServerRequests::default();
 
@@ -919,6 +939,7 @@ mod tests {
             pending.note_server_request(&ServerRequest::CommandExecutionRequestApproval {
                 request_id: AppServerRequestId::Integer(41),
                 params: CommandExecutionRequestApprovalParams {
+                    kind: Default::default(),
                     thread_id: thread_id.to_ascii_uppercase(),
                     turn_id: "turn-1".to_string(),
                     item_id: "call-1".to_string(),

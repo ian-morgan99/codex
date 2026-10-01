@@ -5,6 +5,7 @@ use codex_config::test_support::CloudConfigBundleFixture;
 use codex_core::EnvironmentConfig;
 use codex_core::TurnInputRequest;
 use codex_core::config::Constrained;
+use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_execpolicy::Decision;
 use codex_execpolicy::Policy;
 use codex_execpolicy::RequirementsExecPolicy;
@@ -13,6 +14,7 @@ use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::PermissionProfileSnapshot;
@@ -714,8 +716,12 @@ async fn environment_command_restrictions_override_saved_prefix_approvals() -> R
             &selection,
             EnvironmentConfig {
                 allow_login_shell: true,
+                workspace_roots: selection.workspace_roots.clone(),
                 permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::Disabled),
                 shell_environment_policy: Default::default(),
+                windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
+                windows_sandbox_type: test.config.permissions.windows_sandbox_type,
+                use_legacy_landlock: test.config.features.use_legacy_landlock(),
                 exec_policy: Some(RequirementsExecPolicy::new(invalid_policy)),
                 mcp_policy: None,
                 network_policy: None,
@@ -737,8 +743,12 @@ async fn environment_command_restrictions_override_saved_prefix_approvals() -> R
             &selection,
             EnvironmentConfig {
                 allow_login_shell: true,
+                workspace_roots: selection.workspace_roots.clone(),
                 permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::Disabled),
                 shell_environment_policy: Default::default(),
+                windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
+                windows_sandbox_type: test.config.permissions.windows_sandbox_type,
+                use_legacy_landlock: test.config.features.use_legacy_landlock(),
                 exec_policy: Some(RequirementsExecPolicy::new(environment_policy)),
                 mcp_policy: None,
                 network_policy: None,
@@ -839,10 +849,14 @@ async fn environment_command_policy_changes_invalidate_session_approvals() -> Re
                     &selection,
                     EnvironmentConfig {
                         allow_login_shell: true,
+                        workspace_roots: selection.workspace_roots.clone(),
                         permission_profile: PermissionProfileSnapshot::legacy(
                             PermissionProfile::Disabled,
                         ),
                         shell_environment_policy: Default::default(),
+                        windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
+                        windows_sandbox_type: test.config.permissions.windows_sandbox_type,
+                        use_legacy_landlock: test.config.features.use_legacy_landlock(),
                         exec_policy: Some(RequirementsExecPolicy::new(policy)),
                         mcp_policy: None,
                         network_policy: None,

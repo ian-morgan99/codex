@@ -4,6 +4,7 @@ use crate::tools::context::ToolPayload;
 use crate::tools::handlers::mcp_resource_spec::create_read_mcp_resource_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
+use codex_protocol::openai_models::ToolMessage;
 use codex_protocol::protocol::McpInvocation;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -18,7 +19,9 @@ use super::parse_args;
 use super::parse_arguments;
 use super::run_resource_operation;
 
-pub struct ReadMcpResourceHandler;
+pub struct ReadMcpResourceHandler {
+    spec: ToolSpec,
+}
 
 impl ToolExecutor<ToolInvocation> for ReadMcpResourceHandler {
     fn tool_name(&self) -> ToolName {
@@ -26,19 +29,28 @@ impl ToolExecutor<ToolInvocation> for ReadMcpResourceHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        create_read_mcp_resource_tool()
+        self.spec.clone()
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {
         true
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(self.handle_call(invocation))
     }
 }
 
 impl ReadMcpResourceHandler {
+    pub fn new(messages: Option<&ToolMessage>) -> Self {
+        Self {
+            spec: create_read_mcp_resource_tool(messages),
+        }
+    }
+
     async fn handle_call(
         &self,
         invocation: ToolInvocation,
@@ -74,7 +86,7 @@ impl ReadMcpResourceHandler {
             arguments: arguments.clone(),
         };
 
-        run_resource_operation(&session, turn.as_ref(), &call_id, invocation, async {
+        run_resource_operation(&session, &step_context, &call_id, invocation, async {
             ensure_model_can_access_mcp_server(turn.as_ref(), &server)?;
             let result = mcp
                 .read_resource(&server, ReadResourceRequestParams::new(uri.clone()))

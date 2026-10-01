@@ -45,6 +45,7 @@ use codex_login::AuthDotJson;
 use codex_login::AuthKeyringBackendKind;
 use codex_login::CLIENT_ID_OVERRIDE_ENV_VAR;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
+use codex_login::auth::BedrockAccessKeysAuth;
 use codex_login::auth::BedrockApiKeyAuth;
 use codex_login::load_auth_dot_json;
 use codex_login::login_with_api_key;
@@ -56,14 +57,17 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use serial_test::serial;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 use test_case::test_case;
+use tokio::sync::Notify;
 use tokio::time::timeout;
 use url::Url;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
@@ -75,9 +79,21 @@ const WORKSPACE_ID_SECOND_ALLOWED: &str = "123e4567-e89b-42d3-a456-426614174001"
 const WORKSPACE_ID_DISALLOWED: &str = "123e4567-e89b-42d3-a456-426614174002";
 const WORKSPACE_ID_EMBEDDED: &str = "123e4567-e89b-42d3-a456-426614174010";
 const WORKSPACE_ID_INITIAL: &str = "123e4567-e89b-42d3-a456-426614174011";
-const WORKSPACE_ID_REFRESHED: &str = "123e4567-e89b-42d3-a456-426614174012";
 const WORKSPACE_ID_DEVICE: &str = "123e4567-e89b-42d3-a456-426614174013";
 const WORKSPACE_ID_STALE: &str = "123e4567-e89b-42d3-a456-426614174014";
+
+fn expected_workspace_routing(
+    account_id: &str,
+) -> Option<codex_app_server_protocol::WorkspaceRouting> {
+    Some(codex_app_server_protocol::WorkspaceRouting {
+        chatgpt_account_id: account_id.to_string(),
+        backend_origin: "https://chatgpt.com".to_string(),
+        account_routing_override: codex_app_server_protocol::AccountRoutingOverride::NoConstraint,
+    })
+}
+
+#[path = "account_enterprise_tests.rs"]
+mod enterprise_tests;
 
 // Helper to create a minimal config.toml for the app server
 #[derive(Default)]
@@ -268,23 +284,62 @@ async fn mock_oauth_token(server: &MockServer, id_token: &str) {
         .await;
 }
 
+#[test_case(false; "api_key")]
+#[test_case(true; "enterprise_cleanup_failure")]
 #[tokio::test]
-async fn logout_account_removes_auth_and_notifies() -> Result<()> {
+async fn logout_account_removes_auth_and_notifies(enterprise_cleanup_failure: bool) -> Result<()> {
+    let oauth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/revoke"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(u64::from(enterprise_cleanup_failure))
+        .mount(&oauth_server)
+        .await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
 
-    login_with_api_key(
-        codex_home.path(),
-        "sk-test-key",
-        AuthCredentialsStoreMode::File,
-        AuthKeyringBackendKind::default(),
-    )?;
+    if enterprise_cleanup_failure {
+        write_chatgpt_auth(
+            codex_home.path(),
+            ChatGptAuthFixture::new("access-token")
+                .account_id(WORKSPACE_ID_INITIAL)
+                .chatgpt_user_id("enterprise-user"),
+            AuthCredentialsStoreMode::File,
+        )?;
+        let mut config = read_config_toml(codex_home.path())?;
+        config.as_table_mut().expect("config table").insert(
+            "mcp_enterprise_managed_auth".into(),
+            toml::toml! {
+                [idp]
+                issuer = "https://idp.example"
+                client_id = "enterprise-client"
+            }
+            .into(),
+        );
+        std::fs::write(
+            codex_home.path().join("config.toml"),
+            toml::to_string(&config)?,
+        )?;
+        // Fail credential cleanup before touching the platform keyring.
+        std::fs::write(codex_home.path().join("mcp-oauth-locks"), "not a directory")?;
+    } else {
+        login_with_api_key(
+            codex_home.path(),
+            "sk-test-key",
+            AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+        )?;
+    }
     assert!(codex_home.path().join("auth.json").exists());
 
+    let refresh_url = format!("{}/oauth/token", oauth_server.uri());
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .with_env_overrides(&[("OPENAI_API_KEY", None)])
+        .with_env_overrides(&[
+            ("OPENAI_API_KEY", None),
+            (REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR, Some(&refresh_url)),
+        ])
         .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
         .await?;
 
@@ -415,7 +470,7 @@ async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
             ..Default::default()
         },
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     let access_token = encode_id_token(
         &ChatGptIdTokenClaims::new()
@@ -425,6 +480,7 @@ async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
     )?;
 
     let mut mcp = TestAppServer::builder()
+        .with_mock_chatgpt_backend()
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .with_env_overrides(&[("OPENAI_API_KEY", None)])
@@ -464,6 +520,7 @@ async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
     assert_eq!(
         account,
         GetAccountResponse {
+            workspace_routing: expected_workspace_routing(WORKSPACE_ID_EMBEDDED),
             account: Some(Account::Chatgpt {
                 email: Some("embedded@example.com".to_string()),
                 plan_type: AccountPlanType::Pro,
@@ -498,7 +555,7 @@ async fn account_read_refresh_token_is_noop_in_external_mode() -> Result<()> {
             ..Default::default()
         },
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     let access_token = encode_id_token(
         &ChatGptIdTokenClaims::new()
@@ -508,6 +565,7 @@ async fn account_read_refresh_token_is_noop_in_external_mode() -> Result<()> {
     )?;
 
     let mut mcp = TestAppServer::builder()
+        .with_mock_chatgpt_backend()
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .with_env_overrides(&[("OPENAI_API_KEY", None)])
@@ -540,6 +598,7 @@ async fn account_read_refresh_token_is_noop_in_external_mode() -> Result<()> {
     assert_eq!(
         account,
         GetAccountResponse {
+            workspace_routing: expected_workspace_routing(WORKSPACE_ID_EMBEDDED),
             account: Some(Account::Chatgpt {
                 email: Some("embedded@example.com".to_string()),
                 plan_type: AccountPlanType::Pro,
@@ -587,6 +646,7 @@ async fn respond_to_refresh_request(
 }
 
 async fn mount_disabled_attribution_settings(mock_server: &MockServer) {
+    app_test_support::mount_workspace_routing(mock_server).await;
     Mock::given(method("GET"))
         .and(path("/backend-api/wham/settings/user"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -596,21 +656,27 @@ async fn mount_disabled_attribution_settings(mock_server: &MockServer) {
         .await;
 }
 
+#[test_case("/v1"; "responses")]
+#[test_case("/backend-api/codex"; "discovery")]
 #[tokio::test]
 // 401 response triggers account/chatgptAuthTokens/refresh and retries with new tokens.
-async fn external_auth_refreshes_on_unauthorized() -> Result<()> {
+async fn external_auth_refreshes_on_unauthorized(model_path: &str) -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;
+    let backend = MockServer::start().await;
     create_config_toml(
         codex_home.path(),
         CreateConfigTomlParams {
-            requires_openai_auth: Some(true),
-            base_url: Some(format!("{}/v1", mock_server.uri())),
-            chatgpt_base_url: Some(format!("{}/backend-api", mock_server.uri())),
+            model_provider_id: Some("routing".into()),
+            extra_provider_config: Some(format!(
+                "[model_providers.routing]\nname = \"OpenAI\"\nrequires_openai_auth = true\nbase_url = \"{}{model_path}\"\nrequest_max_retries = 0\nstream_max_retries = 0\n",
+                mock_server.uri(),
+            )),
+            chatgpt_base_url: Some(format!("{}/backend-api", backend.uri())),
             ..Default::default()
         },
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     let success_sse = responses::sse(vec![
         responses::ev_response_created("resp-turn"),
@@ -622,25 +688,33 @@ async fn external_auth_refreshes_on_unauthorized() -> Result<()> {
     }));
     let responses_mock = responses::mount_response_sequence(
         &mock_server,
-        vec![unauthorized, responses::sse_response(success_sse)],
+        if model_path == "/v1" {
+            vec![unauthorized, responses::sse_response(success_sse)]
+        } else {
+            vec![responses::sse_response(success_sse)]
+        },
     )
     .await;
-    mount_disabled_attribution_settings(&mock_server).await;
+    mount_disabled_attribution_settings(&backend).await;
 
     let initial_access_token = encode_id_token(
         &ChatGptIdTokenClaims::new()
             .email("initial@example.com")
+            .chatgpt_user_id("refresh-user")
             .plan_type("pro")
             .chatgpt_account_id(WORKSPACE_ID_INITIAL),
     )?;
+    let refreshed_workspace = WORKSPACE_ID_INITIAL;
     let refreshed_access_token = encode_id_token(
         &ChatGptIdTokenClaims::new()
             .email("refreshed@example.com")
+            .chatgpt_user_id("refresh-user")
             .plan_type("pro")
-            .chatgpt_account_id(WORKSPACE_ID_REFRESHED),
+            .chatgpt_account_id(refreshed_workspace),
     )?;
 
     let mut mcp = TestAppServer::builder()
+        .with_mock_chatgpt_backend()
         .with_codex_home(codex_home.path())
         .with_env_overrides(&[("OPENAI_API_KEY", None)])
         .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
@@ -671,6 +745,25 @@ async fn external_auth_refreshes_on_unauthorized() -> Result<()> {
     let thread: codex_app_server_protocol::ThreadStartResponse =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(thread_req)).await??;
 
+    if model_path != "/v1" {
+        // Force discovery after login cached the same workspace's route.
+        let config_path = codex_home.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            std::fs::read_to_string(&config_path)?.replace("/backend-api\"", "/backend-api/\""),
+        )?;
+        Mock::given(path("/backend-api/wham/accounts/check"))
+            .and(header(
+                "authorization",
+                format!("Bearer {initial_access_token}"),
+            ))
+            .respond_with(ResponseTemplate::new(/*s*/ 401))
+            .with_priority(/*p*/ 1)
+            .expect(/*r*/ 1)
+            .mount(&backend)
+            .await;
+    }
+
     let turn_req = mcp
         .send_turn_start_request(codex_app_server_protocol::TurnStartParams {
             thread_id: thread.thread.id,
@@ -685,26 +778,26 @@ async fn external_auth_refreshes_on_unauthorized() -> Result<()> {
     respond_to_refresh_request(
         &mut mcp,
         &refreshed_access_token,
-        WORKSPACE_ID_REFRESHED,
+        refreshed_workspace,
         Some("pro"),
     )
     .await?;
     let _: codex_app_server_protocol::TurnStartResponse =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turn_req)).await??;
-    let _turn_completed = timeout(
+    let turn_completed = timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
 
+    let completed: TurnCompletedNotification =
+        serde_json::from_value(turn_completed.params.expect("turn/completed params"))?;
+    assert_eq!(completed.turn.status, TurnStatus::Completed);
+
     let requests = responses_mock.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), if model_path == "/v1" { 2 } else { 1 });
     assert_eq!(
-        requests[0].header("authorization"),
-        Some(format!("Bearer {initial_access_token}"))
-    );
-    assert_eq!(
-        requests[1].header("authorization"),
+        requests[requests.len() - 1].header("authorization"),
         Some(format!("Bearer {refreshed_access_token}"))
     );
 
@@ -725,7 +818,7 @@ async fn external_auth_refresh_error_fails_turn() -> Result<()> {
             ..Default::default()
         },
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     let unauthorized = ResponseTemplate::new(401).set_body_json(json!({
         "error": { "message": "unauthorized" }
@@ -742,6 +835,7 @@ async fn external_auth_refresh_error_fails_turn() -> Result<()> {
     )?;
 
     let mut mcp = TestAppServer::builder()
+        .with_mock_chatgpt_backend()
         .with_codex_home(codex_home.path())
         .with_env_overrides(&[("OPENAI_API_KEY", None)])
         .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
@@ -836,7 +930,7 @@ async fn external_auth_refresh_mismatched_workspace_fails_turn() -> Result<()> {
             ..Default::default()
         },
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     let unauthorized = ResponseTemplate::new(401).set_body_json(json!({
         "error": { "message": "unauthorized" }
@@ -859,6 +953,7 @@ async fn external_auth_refresh_mismatched_workspace_fails_turn() -> Result<()> {
     )?;
 
     let mut mcp = TestAppServer::builder()
+        .with_mock_chatgpt_backend()
         .with_codex_home(codex_home.path())
         .with_env_overrides(&[("OPENAI_API_KEY", None)])
         .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
@@ -952,7 +1047,7 @@ async fn external_auth_refresh_invalid_access_token_fails_turn() -> Result<()> {
             ..Default::default()
         },
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     let unauthorized = ResponseTemplate::new(401).set_body_json(json!({
         "error": { "message": "unauthorized" }
@@ -969,6 +1064,7 @@ async fn external_auth_refresh_invalid_access_token_fails_turn() -> Result<()> {
     )?;
 
     let mut mcp = TestAppServer::builder()
+        .with_mock_chatgpt_backend()
         .with_codex_home(codex_home.path())
         .with_env_overrides(&[("OPENAI_API_KEY", None)])
         .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
@@ -1095,8 +1191,13 @@ async fn login_account_api_key_succeeds_and_notifies() -> Result<()> {
     Ok(())
 }
 
+#[test_case("amazonBedrock"; "api_key")]
+#[test_case("amazonBedrockAccessKeys"; "access_keys")]
 #[tokio::test]
-async fn login_amazon_bedrock_replaces_primary_auth_and_persists_provider() -> Result<()> {
+async fn login_amazon_bedrock_replaces_primary_auth_and_persists_provider(
+    credential_type: &str,
+) -> Result<()> {
+    let managed_access_keys = credential_type == "amazonBedrockAccessKeys";
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
     let config_path = codex_home.path().join("config.toml");
@@ -1108,7 +1209,8 @@ async fn login_amazon_bedrock_replaces_primary_auth_and_persists_provider() -> R
              http_headers = {{ X-Existing = \"preserved\" }}\n\
              [model_providers.amazon-bedrock.aws]\n\
              profile = \"stale-profile\"\n\
-             region = \"us-east-1\"\n"
+             region = \"us-east-1\"\n\
+             auth_refresh = {{ command = \"aws\" }}\n"
         ),
     )?;
     login_with_api_key(
@@ -1135,9 +1237,26 @@ async fn login_amazon_bedrock_replaces_primary_auth_and_persists_provider() -> R
         .as_table_mut()
         .expect("AWS configuration should be a table")
         .remove("profile");
-    let request_id = mcp
-        .send_login_account_amazon_bedrock_request(" managed-bedrock-api-key ", " us-west-2 ")
-        .await?;
+    if managed_access_keys {
+        expected_config["model_providers"]["amazon-bedrock"]["aws"]["region"] =
+            toml::Value::String("us-west-2".to_string());
+    }
+    let params = if managed_access_keys {
+        json!({
+            "type": credential_type,
+            "accessKeyId": " test-id ",
+            "secretAccessKey": " test-secret ",
+            "sessionToken": " test-token ",
+            "region": " us-west-2 ",
+        })
+    } else {
+        json!({
+            "type": credential_type,
+            "apiKey": " managed-bedrock-api-key ",
+            "region": " us-west-2 ",
+        })
+    };
+    let request_id = mcp.send_login_account_request(params).await?;
     let response: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
@@ -1151,19 +1270,29 @@ async fn login_amazon_bedrock_replaces_primary_auth_and_persists_provider() -> R
     assert_eq!(
         load_file_auth(codex_home.path())?,
         Some(AuthDotJson {
-            auth_mode: Some(DomainAuthMode::BedrockApiKey),
+            auth_mode: Some(if managed_access_keys {
+                DomainAuthMode::BedrockAccessKeys
+            } else {
+                DomainAuthMode::BedrockApiKey
+            }),
             openai_api_key: None,
             tokens: None,
             last_refresh: None,
             agent_identity: None,
             personal_access_token: None,
-            bedrock_api_key: Some(BedrockApiKeyAuth {
+            bedrock_api_key: (!managed_access_keys).then(|| BedrockApiKeyAuth {
                 api_key: "managed-bedrock-api-key".to_string(),
                 region: "us-west-2".to_string(),
+            }),
+            bedrock_access_keys: managed_access_keys.then(|| BedrockAccessKeysAuth {
+                access_key_id: "test-id".to_string(),
+                secret_access_key: "test-secret".to_string(),
+                session_token: Some("test-token".to_string()),
             }),
         })
     );
     assert_eq!(read_config_toml(codex_home.path())?, expected_config);
+    assert!(!codex_home.path().join(".env").exists());
 
     let notification = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -1182,16 +1311,52 @@ async fn login_amazon_bedrock_replaces_primary_auth_and_persists_provider() -> R
             onboarding_entrypoint: None,
         }
     );
-    assert_account_updated(&mut mcp, Some(AuthMode::BedrockApiKey)).await?;
+    let auth_mode = if managed_access_keys {
+        AuthMode::BedrockAccessKeys
+    } else {
+        AuthMode::BedrockApiKey
+    };
+    assert_account_updated(&mut mcp, Some(auth_mode)).await?;
     assert_eq!(
         read_account(&mut mcp).await?,
         GetAccountResponse {
+            workspace_routing: None,
             account: Some(Account::AmazonBedrock {
                 uses_codex_managed_credentials: true,
             }),
             requires_openai_auth: false,
         }
     );
+
+    if managed_access_keys {
+        let mut expected_logout_config = expected_config;
+        let expected_logout_config_root = expected_logout_config
+            .as_table_mut()
+            .expect("config should be a table");
+        expected_logout_config_root.remove("model_provider");
+        expected_logout_config_root.remove("model");
+        expected_logout_config["model_providers"]["amazon-bedrock"]
+            .as_table_mut()
+            .expect("Bedrock provider config should be a table")
+            .remove("aws");
+
+        let request_id = mcp.send_logout_account_request().await?;
+        let response: LogoutAccountResponse =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+        assert_eq!(response, LogoutAccountResponse {});
+        assert_eq!(load_file_auth(codex_home.path())?, None);
+        assert_eq!(read_config_toml(codex_home.path())?, expected_logout_config);
+        assert!(!codex_home.path().join(".env").exists());
+        assert_account_updated(&mut mcp, /*auth_mode*/ None).await?;
+        assert_eq!(
+            read_account(&mut mcp).await?,
+            GetAccountResponse {
+                workspace_routing: None,
+                account: None,
+                requires_openai_auth: true,
+            }
+        );
+    }
 
     Ok(())
 }
@@ -1256,6 +1421,54 @@ async fn login_amazon_bedrock_rejects_non_bedrock_provider_override_without_chan
 }
 
 #[tokio::test]
+async fn login_amazon_bedrock_access_keys_rejects_overridden_aws_configuration() -> Result<()> {
+    for config_override in [
+        r#"model_providers.amazon-bedrock.aws.profile="other-account""#,
+        r#"model_providers.amazon-bedrock.aws.region="eu-west-1""#,
+    ] {
+        let codex_home = TempDir::new()?;
+        create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
+        login_with_api_key(
+            codex_home.path(),
+            "sk-test-key",
+            AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+        )?;
+        let expected_auth = load_file_auth(codex_home.path())?;
+
+        let mut mcp = TestAppServer::builder()
+            .with_codex_home(codex_home.path())
+            .without_auto_env()
+            .with_env_overrides(&[("OPENAI_API_KEY", None)])
+            .with_args(&["-c", config_override])
+            .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+            .await?;
+
+        let request_id = mcp
+            .send_login_account_request(json!({
+                "type": "amazonBedrockAccessKeys",
+                "accessKeyId": "managed-access-key-id",
+                "secretAccessKey": "managed-secret-access-key",
+                "region": "us-west-2",
+            }))
+            .await?;
+        let error = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+        )
+        .await??;
+
+        assert_eq!(
+            error.error.message,
+            "Amazon Bedrock configuration cannot take effect: Overridden by session flags"
+        );
+        assert_eq!(load_file_auth(codex_home.path())?, expected_auth);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn login_amazon_bedrock_allows_bedrock_provider_override() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
@@ -1301,6 +1514,7 @@ async fn login_amazon_bedrock_allows_bedrock_provider_override() -> Result<()> {
                 api_key: "managed-bedrock-api-key".to_string(),
                 region: "us-west-2".to_string(),
             }),
+            bedrock_access_keys: None,
         })
     );
     assert_eq!(read_config_toml(codex_home.path())?, expected_config);
@@ -1314,15 +1528,15 @@ async fn login_amazon_bedrock_allows_bedrock_provider_override() -> Result<()> {
     Ok(())
 }
 
+#[test_case("amazon-bedrock", "mock-model"; "mantle_clears_generic_model")]
+#[test_case("amazon-bedrock-runtime", "global.openai.gpt-5.6-terra"; "runtime_clears_bedrock_model")]
 #[tokio::test]
-async fn logout_managed_bedrock_restores_default_account() -> Result<()> {
+async fn logout_managed_bedrock_restores_default_account(
+    model_provider_id: &str,
+    model: &str,
+) -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
-    let mut expected_config = read_config_toml(codex_home.path())?;
-    expected_config
-        .as_table_mut()
-        .expect("config should be a table")
-        .remove("model_provider");
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -1351,12 +1565,40 @@ async fn logout_managed_bedrock_restores_default_account() -> Result<()> {
     assert_eq!(
         read_account(&mut mcp).await?,
         GetAccountResponse {
+            workspace_routing: None,
             account: Some(Account::AmazonBedrock {
                 uses_codex_managed_credentials: true,
             }),
             requires_openai_auth: false,
         }
     );
+
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?
+        .replace(
+            "model_provider = \"amazon-bedrock\"",
+            &format!("model_provider = \"{model_provider_id}\""),
+        )
+        .replace(
+            "model = \"mock-model\"",
+            &format!("model = \"{model}\"\nmodel_reasoning_effort = \"high\""),
+        );
+    std::fs::write(
+        config_path,
+        format!(
+            "{config}\n[model_providers.{model_provider_id}]\nbase_url = \"https://bedrock.example.com/v1\"\n[model_providers.{model_provider_id}.aws]\nprofile = \"managed-profile\"\nregion = \"us-west-2\"\nauth_refresh = {{ command = \"aws\" }}\n"
+        ),
+    )?;
+    let mut expected_config = read_config_toml(codex_home.path())?;
+    let expected_config_root = expected_config
+        .as_table_mut()
+        .expect("config should be a table");
+    expected_config_root.remove("model_provider");
+    expected_config_root.remove("model");
+    expected_config["model_providers"][model_provider_id]
+        .as_table_mut()
+        .expect("Bedrock provider config should be a table")
+        .remove("aws");
 
     let request_id = mcp.send_logout_account_request().await?;
     let response = timeout(
@@ -1374,6 +1616,7 @@ async fn logout_managed_bedrock_restores_default_account() -> Result<()> {
     assert_eq!(
         read_account(&mut mcp).await?,
         GetAccountResponse {
+            workspace_routing: None,
             account: None,
             requires_openai_auth: true,
         }
@@ -1382,37 +1625,107 @@ async fn logout_managed_bedrock_restores_default_account() -> Result<()> {
 }
 
 #[tokio::test]
-async fn logout_aws_managed_bedrock_errors_without_changing_auth_or_config() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), aws_managed_bedrock_config())?;
-    login_with_api_key(
-        codex_home.path(),
-        "sk-test-key",
-        AuthCredentialsStoreMode::File,
-        AuthKeyringBackendKind::default(),
-    )?;
-    let expected_auth = load_file_auth(codex_home.path())?;
+async fn logout_aws_managed_bedrock_clears_provider_and_restores_default_account() -> Result<()> {
+    for managed_bedrock_auth in [false, true] {
+        let codex_home = TempDir::new()?;
+        create_config_toml(codex_home.path(), aws_managed_bedrock_config())?;
+        let config_path = codex_home.path().join("config.toml");
+        let config = std::fs::read_to_string(&config_path)?
+            .replace(
+                "model = \"mock-model\"",
+                "model = \"openai.gpt-5.6-sol\"\nmodel_reasoning_effort = \"high\"",
+            )
+            .replace(
+                "[model_providers.amazon-bedrock.aws]",
+                "[model_providers.amazon-bedrock]\nbase_url = \"https://bedrock.example.com/v1\"\n[model_providers.amazon-bedrock.aws]\nauth_refresh = { command = \"aws\" }",
+            );
+        std::fs::write(config_path, config)?;
+        let dotenv_path = codex_home.path().join(".env");
+        let aws_credentials_path = codex_home.path().join("aws-credentials");
+        let dotenv = "AWS_ACCESS_KEY_ID=environment-id\nAWS_SECRET_ACCESS_KEY=environment-secret\n";
+        let aws_credentials = "[codex-bedrock]\naws_access_key_id = profile-id\naws_secret_access_key = profile-secret\n";
+        std::fs::write(&dotenv_path, dotenv)?;
+        std::fs::write(&aws_credentials_path, aws_credentials)?;
+        if managed_bedrock_auth {
+            login_with_bedrock_api_key(
+                codex_home.path(),
+                "managed-bedrock-api-key",
+                "us-east-1",
+                AuthCredentialsStoreMode::File,
+                AuthKeyringBackendKind::default(),
+            )?;
+        } else {
+            login_with_api_key(
+                codex_home.path(),
+                "sk-test-key",
+                AuthCredentialsStoreMode::File,
+                AuthKeyringBackendKind::default(),
+            )?;
+        }
 
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .with_env_overrides(&[("OPENAI_API_KEY", None)])
-        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
-        .await?;
-    let expected_config = read_config_toml(codex_home.path())?;
-    let request_id = mcp.send_logout_account_request().await?;
-    let error = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    assert_eq!(error.error.code, -32600);
-    assert_eq!(
-        error.error.message,
-        "cannot log out while Amazon Bedrock is using AWS-managed credentials; manage those credentials through AWS or switch model providers before logging out Codex authentication"
-    );
-    assert_eq!(load_file_auth(codex_home.path())?, expected_auth);
-    assert_eq!(read_config_toml(codex_home.path())?, expected_config);
+        let aws_credentials_env_path = aws_credentials_path.to_string_lossy();
+        let mut mcp = TestAppServer::builder()
+            .with_codex_home(codex_home.path())
+            .without_auto_env()
+            .with_env_overrides(&[
+                ("OPENAI_API_KEY", None),
+                ("AWS_ACCESS_KEY_ID", Some("environment-id")),
+                ("AWS_SECRET_ACCESS_KEY", Some("environment-secret")),
+                (
+                    "AWS_SHARED_CREDENTIALS_FILE",
+                    Some(aws_credentials_env_path.as_ref()),
+                ),
+            ])
+            .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+            .await?;
+        assert_eq!(
+            read_account(&mut mcp).await?,
+            GetAccountResponse {
+                workspace_routing: None,
+                account: Some(Account::AmazonBedrock {
+                    uses_codex_managed_credentials: false,
+                }),
+                requires_openai_auth: false,
+            }
+        );
+        let mut expected_config = read_config_toml(codex_home.path())?;
+        let expected_config_root = expected_config
+            .as_table_mut()
+            .expect("config should be a table");
+        expected_config_root.remove("model_provider");
+        expected_config_root.remove("model");
+        expected_config["model_providers"]["amazon-bedrock"]
+            .as_table_mut()
+            .expect("Bedrock provider config should be a table")
+            .remove("aws");
+
+        let request_id = mcp.send_logout_account_request().await?;
+        let response = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        )
+        .await??;
+        assert_eq!(
+            to_response::<LogoutAccountResponse>(response)?,
+            LogoutAccountResponse {}
+        );
+        assert_eq!(load_file_auth(codex_home.path())?, None);
+        assert_eq!(read_config_toml(codex_home.path())?, expected_config);
+        assert_eq!(std::fs::read_to_string(dotenv_path)?, dotenv);
+        assert_eq!(
+            std::fs::read_to_string(aws_credentials_path)?,
+            aws_credentials
+        );
+        assert_account_updated(&mut mcp, /*auth_mode*/ None).await?;
+        assert_eq!(
+            read_account(&mut mcp).await?,
+            GetAccountResponse {
+                workspace_routing: None,
+                account: None,
+                requires_openai_auth: true,
+            }
+        );
+    }
     Ok(())
 }
 
@@ -1450,6 +1763,14 @@ async fn logout_managed_bedrock_preserves_changed_provider_without_experimental_
     assert!(matches!(initialized, JSONRPCMessage::Response(_)));
 
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        config_path,
+        format!(
+            "{config}\n[model_providers.amazon-bedrock.aws]\nprofile = \"preserved\"\nregion = \"us-west-2\"\n"
+        ),
+    )?;
     let expected_config = read_config_toml(codex_home.path())?;
 
     let request_id = mcp.send_logout_account_request().await?;
@@ -1468,6 +1789,7 @@ async fn logout_managed_bedrock_preserves_changed_provider_without_experimental_
     assert_eq!(
         read_account(&mut mcp).await?,
         GetAccountResponse {
+            workspace_routing: None,
             account: None,
             requires_openai_auth: false,
         }
@@ -1547,6 +1869,7 @@ async fn login_managed_bedrock_updates_active_bedrock_account() -> Result<()> {
     assert_eq!(
         read_account(&mut mcp).await?,
         GetAccountResponse {
+            workspace_routing: None,
             account: Some(Account::AmazonBedrock {
                 uses_codex_managed_credentials: true,
             }),
@@ -1594,7 +1917,25 @@ async fn login_account_amazon_bedrock_rejects_invalid_credentials_without_change
     .await??;
     assert_eq!(
         error.error.message,
-        "Amazon Bedrock Mantle does not support region `us-west-1`"
+        "Amazon Bedrock does not support region `us-west-1`"
+    );
+
+    let request_id = mcp
+        .send_login_account_request(json!({
+            "type": "amazonBedrockAccessKeys",
+            "accessKeyId": " ",
+            "secretAccessKey": "test-secret",
+            "region": "us-west-2",
+        }))
+        .await?;
+    let error = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert_eq!(
+        error.error.message,
+        "AWS access key ID and secret access key must not be empty."
     );
     assert_eq!(load_file_auth(codex_home.path())?, None);
     assert_eq!(read_config_toml(codex_home.path())?, expected_config);
@@ -1647,6 +1988,7 @@ async fn login_account_amazon_bedrock_rejected_with_external_chatgpt_auth() -> R
     )?;
 
     let mut mcp = TestAppServer::builder()
+        .with_mock_chatgpt_backend()
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
@@ -1701,6 +2043,7 @@ async fn login_account_api_key_rejected_when_forced_chatgpt() -> Result<()> {
     )?;
 
     let mut mcp = TestAppServer::builder()
+        .with_mock_chatgpt_backend()
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
@@ -1765,11 +2108,12 @@ async fn login_account_chatgpt_device_code_returns_error_when_disabled() -> Resu
             ..Default::default()
         },
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
     mock_device_code_usercode_failure(&mock_server, /*status*/ 404).await;
 
     let issuer = mock_server.uri();
     let mut mcp = TestAppServer::builder()
+        .with_mock_chatgpt_backend()
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .with_env_overrides(&[
@@ -1821,7 +2165,8 @@ async fn login_account_chatgpt_device_code_succeeds_and_notifies() -> Result<()>
             ..Default::default()
         },
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
+    let collector = super::auth_storage_originator::configure_collector(codex_home.path()).await?;
 
     mock_device_code_usercode(&mock_server, /*interval_seconds*/ 0).await;
     mock_device_code_token_success(&mock_server).await;
@@ -1835,14 +2180,22 @@ async fn login_account_chatgpt_device_code_succeeds_and_notifies() -> Result<()>
 
     let issuer = mock_server.uri();
     let mut mcp = TestAppServer::builder()
+        .with_mock_chatgpt_backend()
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .with_env_overrides(&[
             ("OPENAI_API_KEY", None),
+            ("OTEL_METRIC_EXPORT_INTERVAL", Some("200")),
             (LOGIN_ISSUER_ENV_VAR, Some(issuer.as_str())),
         ])
-        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .build()
         .await?;
+    mcp.initialize_with_client_info(ClientInfo {
+        name: "codex_vscode".into(),
+        title: None,
+        version: "1".into(),
+    })
+    .await?;
 
     let request_id = mcp.send_login_account_chatgpt_device_code_request().await?;
     let login: LoginAccountResponse =
@@ -1886,6 +2239,199 @@ async fn login_account_chatgpt_device_code_succeeds_and_notifies() -> Result<()>
         codex_home.path().join("auth.json").exists(),
         "auth.json should be created when device code login succeeds"
     );
+    super::auth_storage_originator::assert_saved_originators(&collector, &["codex_vscode"]).await?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum LoginRefreshTrigger {
+    AuthStatus,
+    UnauthorizedConfig,
+}
+
+#[test_case("/backend-api/wham/config/bundle", LoginRefreshTrigger::AuthStatus; "refresh_during_requirements")]
+#[test_case("/backend-api/wham/accounts/check", LoginRefreshTrigger::AuthStatus; "refresh_during_routing")]
+#[test_case("/backend-api/wham/config/bundle", LoginRefreshTrigger::UnauthorizedConfig; "refresh_during_account_read_requirements")]
+#[tokio::test]
+async fn login_survives_same_owner_token_refresh(
+    delayed_path: &str,
+    refresh_trigger: LoginRefreshTrigger,
+) -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let backend = MockServer::start().await;
+    create_config_toml(
+        codex_home.path(),
+        CreateConfigTomlParams {
+            requires_openai_auth: Some(true),
+            chatgpt_base_url: Some(format!("{}/backend-api", backend.uri())),
+            ..Default::default()
+        },
+    )?;
+    write_models_cache(codex_home.path()).await?;
+    mock_device_code_usercode(&backend, /*interval_seconds*/ 0).await;
+    mock_device_code_token_success(&backend).await;
+    let id_token = encode_id_token(
+        &ChatGptIdTokenClaims::new()
+            .email("device@example.com")
+            .plan_type("enterprise")
+            .chatgpt_user_id("device-user")
+            .chatgpt_account_id(WORKSPACE_ID_DEVICE),
+    )?;
+    mock_oauth_token(&backend, &id_token).await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/refresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id_token": id_token,
+            "access_token": "refreshed-access-token",
+            "refresh_token": "refreshed-refresh-token",
+        })))
+        .expect(1)
+        .mount(&backend)
+        .await;
+    let started = Arc::new(Notify::new());
+    for (request_path, response) in [
+        ("/backend-api/wham/config/bundle", json!({})),
+        (
+            "/backend-api/wham/accounts/check",
+            json!({"accounts": [{
+                "id": WORKSPACE_ID_DEVICE, "workspace_backend_origin": "https://chatgpt.com",
+                "account_routing_override": "NO_CONSTRAINT",
+            }]}),
+        ),
+    ] {
+        let mock = Mock::given(method("GET")).and(path(request_path));
+        let mock = if request_path == "/backend-api/wham/accounts/check" {
+            mock.and(header("authorization", "Bearer refreshed-access-token"))
+        } else {
+            mock
+        };
+        mock.respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+            .mount(&backend)
+            .await;
+        if request_path == delayed_path {
+            let request_started = Arc::clone(&started);
+            Mock::given(method("GET"))
+                .and(path(request_path))
+                .and(header("authorization", "Bearer access-token-123"))
+                .respond_with(move |_: &wiremock::Request| {
+                    request_started.notify_one();
+                    ResponseTemplate::new(match refresh_trigger {
+                        LoginRefreshTrigger::AuthStatus => 200,
+                        LoginRefreshTrigger::UnauthorizedConfig => 401,
+                    })
+                    .set_delay(Duration::from_secs(/*secs*/ 2))
+                    .set_body_json(response.clone())
+                })
+                .with_priority(1)
+                .expect(1..=2)
+                .mount(&backend)
+                .await;
+        }
+    }
+    let issuer = backend.uri();
+    let refresh_url = format!("{issuer}/oauth/refresh");
+    let mut server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[
+            ("OPENAI_API_KEY", None),
+            (LOGIN_ISSUER_ENV_VAR, Some(issuer.as_str())),
+            (
+                REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
+                Some(refresh_url.as_str()),
+            ),
+        ])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+    let request = server
+        .send_login_account_chatgpt_device_code_request()
+        .await?;
+    let login: LoginAccountResponse =
+        timeout(DEFAULT_READ_TIMEOUT, server.read_response(request)).await??;
+    let LoginAccountResponse::ChatgptDeviceCode { login_id, .. } = login else {
+        bail!("unexpected login response: {login:?}");
+    };
+    timeout(DEFAULT_READ_TIMEOUT, started.notified()).await?;
+    let expected_account = GetAccountResponse {
+        account: Some(Account::Chatgpt {
+            email: Some("device@example.com".into()),
+            plan_type: AccountPlanType::Enterprise,
+        }),
+        requires_openai_auth: true,
+        workspace_routing: expected_workspace_routing(WORKSPACE_ID_DEVICE),
+    };
+    match refresh_trigger {
+        LoginRefreshTrigger::AuthStatus => {
+            let request = server
+                .send_get_auth_status_request(GetAuthStatusParams {
+                    include_token: Some(true),
+                    refresh_token: Some(true),
+                })
+                .await?;
+            let refreshed: GetAuthStatusResponse =
+                timeout(DEFAULT_READ_TIMEOUT, server.read_response(request)).await??;
+            assert_eq!(
+                refreshed.auth_token.as_deref(),
+                Some("refreshed-access-token")
+            );
+        }
+        LoginRefreshTrigger::UnauthorizedConfig => {
+            assert_eq!(read_account(&mut server).await?, expected_account);
+        }
+    }
+    let completed: AccountLoginCompletedNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        server.read_notification("account/login/completed"),
+    )
+    .await??;
+    assert_eq!(
+        completed,
+        AccountLoginCompletedNotification {
+            login_id: Some(login_id),
+            success: true,
+            error: None,
+            onboarding_entrypoint: None,
+        }
+    );
+    let updated: AccountUpdatedNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        server.read_notification("account/updated"),
+    )
+    .await??;
+    assert_eq!(
+        updated,
+        AccountUpdatedNotification {
+            auth_mode: Some(AuthMode::Chatgpt),
+            plan_type: Some(AccountPlanType::Enterprise),
+        }
+    );
+    assert_eq!(read_account(&mut server).await?, expected_account);
+    let requests = backend
+        .received_requests()
+        .await
+        .expect("recorded requests");
+    let routing_tokens = requests
+        .iter()
+        .filter(|request| request.url.path() == "/backend-api/wham/accounts/check")
+        .map(|request| {
+            request.headers["authorization"]
+                .to_str()
+                .expect("routing authorization header")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        routing_tokens,
+        if delayed_path == "/backend-api/wham/accounts/check" {
+            vec!["Bearer access-token-123", "Bearer refreshed-access-token"]
+        } else if matches!(refresh_trigger, LoginRefreshTrigger::UnauthorizedConfig) {
+            vec![
+                "Bearer refreshed-access-token",
+                "Bearer refreshed-access-token",
+            ]
+        } else {
+            vec!["Bearer refreshed-access-token"]
+        }
+    );
+    backend.verify().await;
     Ok(())
 }
 
@@ -1901,13 +2447,14 @@ async fn login_account_chatgpt_device_code_failure_notifies_without_account_upda
             ..Default::default()
         },
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     mock_device_code_usercode(&mock_server, /*interval_seconds*/ 0).await;
     mock_device_code_token_failure(&mock_server, /*status*/ 500).await;
 
     let issuer = mock_server.uri();
     let mut mcp = TestAppServer::builder()
+        .with_mock_chatgpt_backend()
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .with_env_overrides(&[
@@ -1972,13 +2519,14 @@ async fn login_account_chatgpt_device_code_can_be_cancelled() -> Result<()> {
             ..Default::default()
         },
     )?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     mock_device_code_usercode(&mock_server, /*interval_seconds*/ 1).await;
     mock_device_code_token_failure(&mock_server, /*status*/ 404).await;
 
     let issuer = mock_server.uri();
     let mut mcp = TestAppServer::builder()
+        .with_mock_chatgpt_backend()
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .with_env_overrides(&[
@@ -2044,6 +2592,7 @@ async fn login_account_chatgpt_start_can_be_cancelled() -> Result<()> {
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
 
     let mut mcp = TestAppServer::builder()
+        .with_mock_chatgpt_backend()
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
@@ -2056,8 +2605,8 @@ async fn login_account_chatgpt_start_can_be_cancelled() -> Result<()> {
         bail!("unexpected login response: {login:?}");
     };
     assert!(
-        auth_url.contains("redirect_uri=http%3A%2F%2Flocalhost"),
-        "auth_url should contain a redirect_uri to localhost"
+        auth_url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A"),
+        "auth_url should contain a redirect_uri to 127.0.0.1"
     );
 
     let cancel_id = mcp
@@ -2099,16 +2648,28 @@ async fn login_account_chatgpt_start_can_be_cancelled() -> Result<()> {
 #[tokio::test]
 // Serialize tests that launch the login server since it binds to a fixed port.
 #[serial(login_port)]
-async fn login_account_chatgpt_uses_debug_oauth_overrides() -> Result<()> {
+async fn login_account_chatgpt_uses_oauth_overrides() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
+    let mock_server = MockServer::start().await;
+    let id_token = encode_id_token(
+        &ChatGptIdTokenClaims::new()
+            .email("staging@example.com")
+            .plan_type("pro")
+            .chatgpt_account_id(WORKSPACE_ID_EMBEDDED),
+    )?;
+    mock_oauth_token(&mock_server, &id_token).await;
+    let issuer = mock_server.uri();
 
     let mut mcp = TestAppServer::builder()
+        .with_mock_chatgpt_backend()
         .with_codex_home(codex_home.path())
         .without_auto_env()
+        // Exercise packaged-build behavior without the debug-only startup flag.
+        .with_plugin_startup_tasks()
         .with_env_overrides(&[
             (CLIENT_ID_OVERRIDE_ENV_VAR, Some("staging-client")),
-            (LOGIN_ISSUER_ENV_VAR, Some("https://auth.example.com")),
+            (LOGIN_ISSUER_ENV_VAR, Some(issuer.as_str())),
         ])
         .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
         .await?;
@@ -2120,10 +2681,7 @@ async fn login_account_chatgpt_uses_debug_oauth_overrides() -> Result<()> {
         bail!("unexpected login response: {login:?}");
     };
     let auth_url = Url::parse(&auth_url)?;
-    assert_eq!(
-        auth_url.origin().ascii_serialization(),
-        "https://auth.example.com"
-    );
+    assert_eq!(auth_url.origin().ascii_serialization(), issuer);
     assert_eq!(
         auth_url
             .query_pairs()
@@ -2131,11 +2689,69 @@ async fn login_account_chatgpt_uses_debug_oauth_overrides() -> Result<()> {
         Some("staging-client".to_string())
     );
 
-    let cancel_id = mcp
-        .send_cancel_login_account_request(CancelLoginAccountParams { login_id })
-        .await?;
-    let _: CancelLoginAccountResponse =
-        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(cancel_id)).await??;
+    let callback_url = auth_url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "redirect_uri").then_some(value.into_owned()))
+        .ok_or_else(|| anyhow::anyhow!("missing redirect_uri"))?;
+    let state = auth_url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then_some(value.into_owned()))
+        .ok_or_else(|| anyhow::anyhow!("missing state"))?;
+    let token_redirect_uri = callback_url.clone();
+    let mut callback_url = Url::parse(&callback_url)?;
+    callback_url
+        .query_pairs_mut()
+        .append_pair("code", "test-code")
+        .append_pair("state", &state);
+    let client = HttpClientBuilder::new()
+        .without_redirects()
+        .build_direct()?;
+    let response = client.get(callback_url.clone()).send().await?;
+    assert_eq!(response.status(), 302);
+    let success_url = Url::parse(response.headers()["location"].to_str()?)?;
+    assert_eq!(success_url.origin(), callback_url.origin());
+    let response = client.get(success_url).send().await?;
+    assert_eq!(response.status(), 200);
+
+    let requests = mock_server
+        .received_requests()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("failed to read OAuth requests"))?;
+    let token_request = requests
+        .iter()
+        .find(|request| {
+            request.url.path() == "/oauth/token"
+                && url::form_urlencoded::parse(&request.body)
+                    .any(|(key, value)| key == "grant_type" && value == "authorization_code")
+        })
+        .ok_or_else(|| anyhow::anyhow!("missing authorization-code token exchange"))?;
+    let token_form: std::collections::HashMap<_, _> =
+        url::form_urlencoded::parse(&token_request.body)
+            .into_owned()
+            .collect();
+    assert_eq!(
+        token_form.get("client_id").map(String::as_str),
+        Some("staging-client")
+    );
+    assert_eq!(token_form.get("redirect_uri"), Some(&token_redirect_uri));
+
+    let notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("account/login/completed"),
+    )
+    .await??;
+    let ServerNotification::AccountLoginCompleted(payload) = notification.try_into()? else {
+        bail!("unexpected notification")
+    };
+    assert_eq!(
+        payload,
+        AccountLoginCompletedNotification {
+            login_id: Some(login_id),
+            success: true,
+            error: None,
+            onboarding_entrypoint: None,
+        }
+    );
     Ok(())
 }
 
@@ -2248,6 +2864,7 @@ async fn set_auth_token_cancels_active_chatgpt_login() -> Result<()> {
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
 
     let mut mcp = TestAppServer::builder()
+        .with_mock_chatgpt_backend()
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
@@ -2313,6 +2930,7 @@ async fn login_account_chatgpt_includes_forced_workspace_query_param() -> Result
     )?;
 
     let mut mcp = TestAppServer::builder()
+        .with_mock_chatgpt_backend()
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
@@ -2348,6 +2966,7 @@ async fn login_account_chatgpt_includes_forced_workspace_allowlist_query_param()
     )?;
 
     let mut mcp = TestAppServer::builder()
+        .with_mock_chatgpt_backend()
         .with_codex_home(codex_home.path())
         .without_auto_env()
         .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
@@ -2436,6 +3055,7 @@ async fn get_account_with_api_key() -> Result<()> {
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
 
     let expected = GetAccountResponse {
+        workspace_routing: None,
         account: Some(Account::ApiKey {}),
         requires_openai_auth: true,
     };
@@ -2469,6 +3089,7 @@ async fn get_account_when_auth_not_required() -> Result<()> {
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
 
     let expected = GetAccountResponse {
+        workspace_routing: None,
         account: None,
         requires_openai_auth: false,
     };
@@ -2509,6 +3130,7 @@ region = "us-west-2"
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
 
     let expected = GetAccountResponse {
+        workspace_routing: None,
         account: Some(Account::AmazonBedrock {
             uses_codex_managed_credentials: false,
         }),
@@ -2547,6 +3169,7 @@ command = "print-token"
     assert_eq!(
         read_account(&mut mcp).await?,
         GetAccountResponse {
+            workspace_routing: None,
             account: Some(Account::AmazonBedrock {
                 uses_codex_managed_credentials: false,
             }),
@@ -2585,6 +3208,7 @@ region = "us-west-2"
     assert_eq!(
         read_account(&mut mcp).await?,
         GetAccountResponse {
+            workspace_routing: None,
             account: Some(Account::AmazonBedrock {
                 uses_codex_managed_credentials: false,
             }),
@@ -2650,6 +3274,7 @@ async fn get_account_with_managed_bedrock_provider() -> Result<()> {
     assert_eq!(
         received,
         GetAccountResponse {
+            workspace_routing: None,
             account: Some(Account::AmazonBedrock {
                 uses_codex_managed_credentials: true,
             }),
@@ -2672,6 +3297,7 @@ async fn get_account_with_chatgpt() -> Result<()> {
     write_chatgpt_auth(
         codex_home.path(),
         ChatGptAuthFixture::new("access-chatgpt")
+            .account_id("account-123")
             .email("user@example.com")
             .plan_type("pro"),
         AuthCredentialsStoreMode::File,
@@ -2693,6 +3319,7 @@ async fn get_account_with_chatgpt() -> Result<()> {
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
 
     let expected = GetAccountResponse {
+        workspace_routing: expected_workspace_routing("account-123"),
         account: Some(Account::Chatgpt {
             email: Some("user@example.com".to_string()),
             plan_type: AccountPlanType::Pro,
@@ -2703,6 +3330,7 @@ async fn get_account_with_chatgpt() -> Result<()> {
     Ok(())
 }
 
+#[test_case("promax", AccountPlanType::ProMax; "pro_max")]
 #[test_case("self_serve_business_prolite", AccountPlanType::SelfServeBusinessProLite; "business_prolite")]
 #[test_case("edu_plus", AccountPlanType::EduPlus; "edu_plus")]
 #[test_case("edu_pro", AccountPlanType::EduPro; "edu_pro")]
@@ -2722,6 +3350,7 @@ async fn get_account_with_chatgpt_plan_variants_returns_plan_type(
     write_chatgpt_auth(
         codex_home.path(),
         ChatGptAuthFixture::new("access-chatgpt")
+            .account_id("account-123")
             .email("user@example.com")
             .plan_type(plan_type),
         AuthCredentialsStoreMode::File,
@@ -2745,6 +3374,7 @@ async fn get_account_with_chatgpt_plan_variants_returns_plan_type(
     assert_eq!(
         received,
         GetAccountResponse {
+            workspace_routing: expected_workspace_routing("account-123"),
             account: Some(Account::Chatgpt {
                 email: Some("user@example.com".to_string()),
                 plan_type: expected_plan,
@@ -2767,7 +3397,9 @@ async fn get_account_with_chatgpt_without_email() -> Result<()> {
     )?;
     write_chatgpt_auth(
         codex_home.path(),
-        ChatGptAuthFixture::new("access-chatgpt").plan_type("pro"),
+        ChatGptAuthFixture::new("access-chatgpt")
+            .account_id("account-123")
+            .plan_type("pro"),
         AuthCredentialsStoreMode::File,
     )?;
 
@@ -2789,6 +3421,7 @@ async fn get_account_with_chatgpt_without_email() -> Result<()> {
     assert_eq!(
         received,
         GetAccountResponse {
+            workspace_routing: expected_workspace_routing("account-123"),
             account: Some(Account::Chatgpt {
                 email: None,
                 plan_type: AccountPlanType::Pro,
@@ -2870,6 +3503,7 @@ async fn get_account_omits_chatgpt_after_permanent_refresh_failure() -> Result<(
     assert_eq!(
         received,
         GetAccountResponse {
+            workspace_routing: None,
             account: None,
             requires_openai_auth: true,
         }
@@ -2890,7 +3524,9 @@ async fn get_account_with_chatgpt_missing_plan_claim_returns_unknown() -> Result
     )?;
     write_chatgpt_auth(
         codex_home.path(),
-        ChatGptAuthFixture::new("access-chatgpt").email("user@example.com"),
+        ChatGptAuthFixture::new("access-chatgpt")
+            .account_id("account-123")
+            .email("user@example.com"),
         AuthCredentialsStoreMode::File,
     )?;
 
@@ -2910,6 +3546,7 @@ async fn get_account_with_chatgpt_missing_plan_claim_returns_unknown() -> Result
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
 
     let expected = GetAccountResponse {
+        workspace_routing: expected_workspace_routing("account-123"),
         account: Some(Account::Chatgpt {
             email: Some("user@example.com".to_string()),
             plan_type: AccountPlanType::Unknown,
